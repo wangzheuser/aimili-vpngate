@@ -18,6 +18,45 @@ def parse_positive_int(value: str | None, default: int) -> int:
 
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
+DNS_CACHE_TTL = parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_TTL"), 60)
+DNS_CACHE_MAX = parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_MAX"), 1024)
+RELAY_HIGH_WATER = parse_positive_int(os.environ.get("LOCAL_PROXY_RELAY_BUFFER"), 262144)
+RELAY_IDLE_TIMEOUT = parse_positive_int(os.environ.get("LOCAL_PROXY_RELAY_TIMEOUT"), 300)
+_dns_cache: dict[str, tuple[str, float]] = {}
+_dns_cache_lock = threading.Lock()
+
+
+class ConnRegistry:
+    """登记代理实例的下游连接，支持切换隧道时唤醒并关闭旧连接。"""
+
+    def __init__(self) -> None:
+        self._connections: set[socket.socket] = set()
+        self._lock = threading.Lock()
+
+    def add(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._connections.add(sock)
+
+    def discard(self, sock: socket.socket) -> None:
+        with self._lock:
+            self._connections.discard(sock)
+
+    def close_all(self) -> int:
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        closed = 0
+        for sock in connections:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+                closed += 1
+            except OSError:
+                pass
+        return closed
 
 def parse_int(value: Any) -> int:
     try:
@@ -84,7 +123,13 @@ def check_credentials(username: str | None, password: str | None) -> bool:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
 
-def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
+def dns_query_over_tun0(
+    host: str,
+    qtype: int,
+    dns_server: str,
+    timeout: float,
+    device: str = "tun0",
+) -> str | None:
     import random
     sock = None
     try:
@@ -109,7 +154,7 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, device.encode("utf-8"))
         except OSError as e:
             if "operation not permitted" in str(e).lower() or e.errno == 1:
                 print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！", flush=True)
@@ -178,7 +223,17 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
         return None
     return None
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+def get_tun_dns_servers() -> list[str]:
+    servers = [item.strip() for item in os.environ.get("OPENVPN_TUN_DNS", "8.8.8.8,1.1.1.1").split(",") if item.strip()]
+    return servers or ["8.8.8.8"]
+
+
+def resolve_dns_over_tun0(
+    host: str,
+    dns_server: str | None = None,
+    timeout: float = 3.0,
+    device: str = "tun0",
+) -> str | None:
     try:
         socket.inet_aton(host)
         return host
@@ -189,11 +244,45 @@ def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float
         return host
     except OSError:
         pass
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    cache_key = f"{device}|{host}"
+    now = time.time()
+    with _dns_cache_lock:
+        cached = _dns_cache.get(cache_key)
+        if cached and now - cached[1] < DNS_CACHE_TTL:
+            return cached[0]
 
-def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
+    servers = [dns_server] if dns_server else get_tun_dns_servers()
+    resolved = None
+    for server in servers:
+        resolved = (
+            dns_query_over_tun0(host, 1, server, timeout, device)
+            or dns_query_over_tun0(host, 28, server, timeout, device)
+        )
+        if resolved:
+            break
+    if resolved:
+        with _dns_cache_lock:
+            if len(_dns_cache) >= DNS_CACHE_MAX:
+                _dns_cache.clear()
+            _dns_cache[cache_key] = (resolved, now)
+    return resolved
+
+
+def purge_dns_cache(device: str | None = None) -> int:
+    with _dns_cache_lock:
+        if device is None:
+            count = len(_dns_cache)
+            _dns_cache.clear()
+            return count
+        prefix = f"{device}|"
+        keys = [key for key in _dns_cache if key.startswith(prefix)]
+        for key in keys:
+            _dns_cache.pop(key, None)
+        return len(keys)
+
+def create_connection(address: tuple[str, int], timeout: float = 20, device: str = "tun0") -> socket.socket:
     host, port = address
-    resolved_ip = resolve_dns_over_tun0(host)
+    resolved_ip = resolve_dns_over_tun0(host, device=device)
     if resolved_ip:
         host = resolved_ip
 
@@ -204,7 +293,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         try:
             sock = socket.socket(af, socktype, proto)
             sock.settimeout(timeout)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, device.encode("utf-8"))
             sock.connect(sa)
             return sock
         except OSError as e:
@@ -221,19 +310,62 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
         raise OSError("getaddrinfo returns empty list")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
-    sockets = [left, right]
+    left.setblocking(False)
+    right.setblocking(False)
+    peer = {left: right, right: left}
+    buffers: dict[socket.socket, bytearray] = {left: bytearray(), right: bytearray()}
+    read_open = {left: True, right: True}
+    write_shutdown = {left: False, right: False}
     while True:
-        readable, _, errored = select.select(sockets, [], sockets, 120)
-        if errored or not readable:
+        readable_targets = [sock for sock in (left, right) if read_open[sock] and len(buffers[peer[sock]]) < RELAY_HIGH_WATER]
+        writable_targets = [sock for sock in (left, right) if buffers[sock]]
+        if not readable_targets and not writable_targets:
+            return
+        try:
+            readable, writable, errored = select.select(
+                readable_targets,
+                writable_targets,
+                (left, right),
+                RELAY_IDLE_TIMEOUT,
+            )
+        except (OSError, ValueError):
+            return
+        if errored or (not readable and not writable):
             return
         for source in readable:
-            target = right if source is left else left
-            data = source.recv(65536)
-            if not data:
+            try:
+                data = source.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
                 return
-            target.sendall(data)
+            if data:
+                buffers[peer[source]].extend(data)
+            else:
+                read_open[source] = False
+        for target in writable:
+            if not buffers[target]:
+                continue
+            try:
+                sent = target.send(buffers[target])
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return
+            if sent:
+                del buffers[target][:sent]
+        for source in (left, right):
+            target = peer[source]
+            if not read_open[source] and not buffers[target] and not write_shutdown[target]:
+                try:
+                    target.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+                write_shutdown[target] = True
+        if not read_open[left] and not buffers[right] and not read_open[right] and not buffers[left]:
+            return
 
-def socks5_client(client: socket.socket, first_byte: bytes) -> None:
+def socks5_client(client: socket.socket, first_byte: bytes, device: str = "tun0") -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
@@ -273,7 +405,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
             return
         port = int.from_bytes(recv_exact(client, 2), "big")
         try:
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, device=device)
         except Exception as e:
             print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
             try:
@@ -297,7 +429,7 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes) -> None:
+def http_client(client: socket.socket, first_byte: bytes, device: str = "tun0") -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -325,7 +457,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
                 return
         if method.upper() == "CONNECT":
             host, port = parse_host_port(target, 443)
-            upstream = create_connection((host, port), timeout=20)
+            upstream = create_connection((host, port), timeout=20, device=device)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             if rest:
                 upstream.sendall(rest)
@@ -364,7 +496,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
         request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((hostname, port), timeout=20)
+        upstream = create_connection((hostname, port), timeout=20, device=device)
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
@@ -378,14 +510,14 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
+def proxy_client(client: socket.socket, address: tuple[str, int], device: str = "tun0") -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first)
+            socks5_client(client, first, device)
         else:
-            http_client(client, first)
+            http_client(client, first, device)
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
@@ -395,7 +527,13 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
+def start_proxy_server(
+    host: str,
+    port: int,
+    device: str = "tun0",
+    stop_event: threading.Event | None = None,
+    registry: ConnRegistry | None = None,
+) -> None:
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     server = None
@@ -451,7 +589,19 @@ def start_proxy_server(host: str, port: int) -> None:
             print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag_msg}", flush=True)
             return
 
+    if stop_event is not None:
+        server.settimeout(1.0)
+
     while True:
+        if stop_event is not None and stop_event.is_set():
+            if registry is not None:
+                registry.close_all()
+            try:
+                server.close()
+            except OSError:
+                pass
+            print(f"[代理网关] 已停止监听 {host}:{port} ({device})", flush=True)
+            return
         try:
             client, address = server.accept()
             if not proxy_connection_sem.acquire(blocking=False):
@@ -464,11 +614,29 @@ def start_proxy_server(host: str, port: int) -> None:
 
             def run_client(client_socket: socket.socket = client, client_address: tuple[str, int] = address) -> None:
                 try:
-                    proxy_client(client_socket, client_address)
+                    if registry is not None:
+                        registry.add(client_socket)
+                    # 保持默认 tun0 的旧测试和调用签名兼容；槽位显式传设备。
+                    if device == "tun0" and registry is None:
+                        proxy_client(client_socket, client_address)
+                    else:
+                        proxy_client(client_socket, client_address, device)
                 finally:
+                    if registry is not None:
+                        registry.discard(client_socket)
                     proxy_connection_sem.release()
 
             threading.Thread(target=run_client, daemon=True).start()
+        except socket.timeout:
+            continue
         except Exception as e:
+            if stop_event is not None and stop_event.is_set():
+                if registry is not None:
+                    registry.close_all()
+                try:
+                    server.close()
+                except OSError:
+                    pass
+                return
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)

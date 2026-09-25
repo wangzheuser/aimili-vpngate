@@ -29,7 +29,7 @@
 | **OpenMili** | OpenMili Ai 中转站推荐：GPT-6 Astra & Images 2.0 Pro 美区原价 0.12倍率 不掺假、不降智，接受任何压力测试！| [立即查看](https://openmili.com/) |
 | **JTTI VPS** | 稳定建站服务器推荐：5 Mbps 独享带宽 无限流量 CN2/9929/CMI三网直连，跨境网站访问低延迟，长期稳定API运营。| [立即查看](https://www.jtti.cc/zh/activity/y2026-national-day.html?k=baoweise) |
 
-AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与检测、连接切换、Web 管理后台，以及共用一个端口的 HTTP、HTTPS 网站代理和 SOCKS5 代理服务。
+AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与检测、连接切换、Web 管理后台，以及共用一个端口的 HTTP、HTTPS 网站代理和 SOCKS5 代理服务。当前分支还支持多个独立的住宅 IP 出口槽位，可按国家、ISP 和 IP 可信度筛选节点，并导出 3x-ui 出站配置。
 
 | 项目 | 默认值或支持范围 |
 | --- | --- |
@@ -194,6 +194,51 @@ curl -x http://127.0.0.1:7928 https://api.ipify.org
 curl --proxy socks5h://127.0.0.1:7928 https://api.ipify.org
 ```
 
+### 4. 多出口住宅 IP
+
+登录 Web 面板后点击“多出口住宅 IP”，设置槽位数量和默认筛选条件。每个槽位会使用独立的 TUN 设备、策略路由表和本地代理端口：
+
+| 配置项 | 默认值 | 槽位 `n` 的实际资源 |
+| --- | --- | --- |
+| `SLOT_DEV_BASE` | `120` | `tun(120+n)` |
+| `SLOT_TABLE_BASE` | `200` | 路由表 `200+n` |
+| `SLOT_PORT_BASE` | `17928` | `127.0.0.1:17928+n` |
+| `MULTI_EXIT_SLOTS` | `0` | 默认启用的槽位数 |
+
+面板支持槽位启停、删除、手动换 IP、国家/ISP 筛选和指定节点。住宅模式只接受 `residential`/`mobile` 且可信度为中或高的节点；未满足证据阈值的节点会被排除。点击“下载 3x-ui 出站”可导出当前真实运行槽位的 `socks` outbounds。
+
+容器部署可以在 `compose.yaml` 中调整 `MULTI_EXIT_SLOTS`、`MAX_EXIT_SLOTS`、`SLOT_*` 及健康检查间隔。宿主机必须提供 `/dev/net/tun`、`NET_ADMIN`、`NET_RAW` 和策略路由能力。部署后可运行只读自检：
+
+```bash
+docker exec aimilivpn bash /app/scripts/selfcheck_multiexit.sh
+```
+
+源码部署可直接执行：
+
+```bash
+VPNGATE_DATA_DIR="$PWD/vpngate_data" bash scripts/selfcheck_multiexit.sh
+```
+
+### 5. 动态代理池（保留原有出口）
+
+动态池是独立的 SOCKS5 服务，会周期读取槽位状态，只选择 `status=up` 且
+`egress_ok=true` 的槽位；每条连接在建立时固定一个出口。默认仅监听
+`127.0.0.1:19380`，不会替换或改写现有 `127.0.0.1:7928` 的 `aimili-vpngate`。
+
+```bash
+python3 scripts/aimili_dynamic_pool.py \
+  --config deploy/aimili-dynamic-pool/config.validation.json
+```
+
+接入 3x-ui 时新增一个指向 `127.0.0.1:19380` 的 SOCKS outbound，再将独立 canary
+入站路由到该 outbound。增量脚本、systemd 单元和定向回滚命令见
+`deploy/aimili-dynamic-pool/README.md`。
+
+验证环境中的 `in-10083-tcp` 只监听 Docker 网关 `172.17.0.1`，并且没有关联到现有
+订阅客户端，因此不会出现在公共订阅中，也不能直接从本机 Clash Verge Rev 连接。
+要对外使用，需要单独确认并启用 Cloudflare WebSocket 路由
+`/ws-isp-7899-7f4d9c2a -> 172.17.0.1:10083`，再把该入站关联到订阅客户端。
+
 <details>
 <summary><strong>查看 Shell 环境变量与 Python 示例</strong></summary>
 
@@ -217,7 +262,7 @@ print(response.text)
 
 </details>
 
-### 4. 从电脑或其他设备连接
+### 6. 从电脑或其他设备连接
 
 代理默认只监听 VPS 回环地址。推荐使用 SSH 隧道，不要直接暴露代理端口：
 

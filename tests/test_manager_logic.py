@@ -89,6 +89,7 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "API_CACHE_FILE", root / "api_snapshot.csv"),
             mock.patch.object(manager, "API_CACHE_META_FILE", root / "api_snapshot.meta.json"),
             mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
+            mock.patch.object(manager, "SLOTS_FILE", root / "slots.json"),
             mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
             mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
         ]
@@ -161,6 +162,30 @@ class ManagerLogicTests(unittest.TestCase):
         stored = manager.read_nodes()
         self.assertEqual(5, sum(node.get("probe_status") == "available" for node in stored))
         self.assertEqual(7, sum(node.get("probe_status") == "not_checked" for node in stored))
+
+    def test_node_probe_finishes_required_slot_candidates_before_target_shortcut(self) -> None:
+        nodes = self.write_nodes(7)
+        calls = []
+
+        def fake_openvpn(config_file, **kwargs):
+            calls.append(config_file)
+            return True, "ready", None
+
+        with (
+            mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=10),
+            mock.patch.object(manager.vpn_utils, "enrich_ip_info"),
+            mock.patch.object(manager, "run_openvpn_until_ready", side_effect=fake_openvpn),
+            mock.patch.object(manager, "NODE_PROBE_WORKERS", 3),
+        ):
+            results = manager.test_multiple_nodes(
+                [node["id"] for node in nodes],
+                target_available=3,
+                required_node_ids={node["id"] for node in nodes},
+            )
+
+        self.assertEqual(7, len(calls))
+        self.assertEqual(7, len(results))
+        self.assertEqual(7, sum(node.get("probe_status") == "available" for node in manager.read_nodes()))
 
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
         residential, residential_reason = manager.vpn_utils.classify_ip_type(
@@ -1043,8 +1068,135 @@ class ManagerLogicTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no valid nodes"):
             snapshot_utils.parse_and_validate_snapshot(csv_text)
 
+    def test_legacy_exit_slot_count_is_migrated_to_stable_active_indexes(self) -> None:
+        auth_file = manager.DATA_DIR / "ui_auth.json"
+        manager.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        auth_file.write_text(
+            json.dumps({"username": "u", "password": "p", "exit_slot_count": 3}),
+            encoding="utf-8",
+        )
+
+        cfg = manager.load_ui_config()
+
+        self.assertEqual([0, 1, 2], cfg["exit_slot_active"])
+        self.assertEqual(3, cfg["exit_slot_count"])
+
+    def test_slot_selection_applies_country_isp_and_residential_confidence_filters(self) -> None:
+        nodes = [
+            {"id": "jp-good", "probe_status": "available", "country_short": "JP", "owner": "NTT", "ip_type": "residential", "ip_type_confidence": "high", "latency_ms": 20, "score": 900},
+            {"id": "jp-low", "probe_status": "available", "country_short": "JP", "owner": "NTT", "ip_type": "residential", "ip_type_confidence": "low", "latency_ms": 1, "score": 1000},
+            {"id": "us-good", "probe_status": "available", "country_short": "US", "owner": "NTT", "ip_type": "mobile", "ip_type_confidence": "medium", "latency_ms": 5, "score": 950},
+        ]
+        manager.write_json(manager.NODES_FILE, nodes)
+
+        selected = manager.select_slot_nodes(set(), 5, "JP", True, "NTT")
+
+        self.assertEqual(["jp-good"], [node["id"] for node in selected])
+
+    def test_slot_dropdown_candidates_follow_slot_filters(self) -> None:
+        nodes = [
+            {"id": "kr-good", "probe_status": "available", "country_short": "KR", "owner": "Korea Telecom", "ip_type": "residential", "ip_type_confidence": "medium", "latency_ms": 20, "score": 900},
+            {"id": "kr-hosting", "probe_status": "available", "country_short": "KR", "owner": "Korea Telecom", "ip_type": "hosting", "ip_type_confidence": "high", "latency_ms": 1, "score": 1000},
+            {"id": "jp-good", "probe_status": "available", "country_short": "JP", "owner": "KDDI", "ip_type": "residential", "ip_type_confidence": "high", "latency_ms": 5, "score": 950},
+        ]
+        manager.write_json(manager.NODES_FILE, nodes)
+        manager._save_slot_lists(manager.load_ui_config(), active=[0])
+        manager.set_slot_country(0, "KR")
+        manager.exit_slots.clear()
+        manager.exit_slots[0] = {"slot": 0, "node_id": ""}
+
+        candidates = manager.slot_node_candidates(0, set())
+
+        self.assertEqual(["kr-good"], [node["id"] for node in candidates])
+
+    def test_pending_slot_probe_includes_unclassified_nodes(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [{
+                "id": "kr-unknown",
+                "country": "韩国",
+                "country_short": "KR",
+                "probe_status": "not_checked",
+                "ip_type": "",
+                "ip_type_confidence": "",
+            }],
+        )
+        manager._save_slot_lists(manager.load_ui_config(), active=[0])
+        manager.set_slot_country(0, "KR")
+
+        required = manager.pending_slot_probe_ids(manager.read_nodes())
+
+        self.assertEqual({"kr-unknown"}, required)
+
+    def test_policy_routing_uses_requested_interface_and_table(self) -> None:
+        with (
+            mock.patch.object(manager.subprocess, "run") as run_mock,
+            mock.patch.object(manager.time, "sleep"),
+        ):
+            self.assertTrue(manager.setup_policy_routing("tun123", 456))
+
+        calls = [call.args[0] for call in run_mock.call_args_list]
+        self.assertIn(["ip", "route", "add", "default", "dev", "tun123", "table", "456"], calls)
+        self.assertIn(["ip", "rule", "add", "oif", "tun123", "table", "456"], calls)
+
+    def test_slot_port_index_remains_stable_after_delete(self) -> None:
+        cfg = manager.load_ui_config()
+        manager._save_slot_lists(cfg, active=[0, 1, 2])
+        with mock.patch.object(manager, "tear_down_slot"), mock.patch.object(manager, "write_slots_state"):
+            result = manager.delete_slot(1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual([0, 2], manager.get_active_slots())
+        self.assertEqual(manager.SLOT_PORT_BASE + 2, manager.slot_port(2))
+
+    def test_slot_count_update_preserves_non_contiguous_indexes(self) -> None:
+        cfg = manager.load_ui_config()
+        manager._save_slot_lists(cfg, active=[1, 2])
+
+        manager.set_exit_slot_config(count=2)
+
+        self.assertEqual([1, 2], manager.get_active_slots())
+
+    def test_3xui_export_contains_only_live_slot_processes(self) -> None:
+        live = FakeProcess()
+        dead = FakeProcess()
+        dead.running = False
+        manager.exit_slots.clear()
+        manager.exit_slots.update(
+            {
+                0: {"slot": 0, "port": 17928, "country_short": "JP", "process": live},
+                1: {"slot": 1, "port": 17929, "country_short": "US", "process": dead},
+            }
+        )
+
+        exported = manager.build_3xui_outbounds()
+
+        self.assertEqual([17928], [item["settings"]["servers"][0]["port"] for item in exported["outbounds"]])
+        manager.exit_slots.clear()
+
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
+    def test_connection_registry_closes_all_registered_sockets(self) -> None:
+        left, right = __import__("socket").socketpair()
+        registry = proxy_server.ConnRegistry()
+        registry.add(left)
+        registry.add(right)
+
+        closed = registry.close_all()
+
+        self.assertEqual(2, closed)
+        with self.assertRaises(OSError):
+            left.send(b"x")
+
+    def test_dns_cache_isolated_by_tun_device_and_can_be_purged(self) -> None:
+        proxy_server.purge_dns_cache()
+        with mock.patch.object(proxy_server, "dns_query_over_tun0", return_value="198.51.100.9") as query:
+            self.assertEqual("198.51.100.9", proxy_server.resolve_dns_over_tun0("example.test", device="tun120"))
+            self.assertEqual("198.51.100.9", proxy_server.resolve_dns_over_tun0("example.test", device="tun121"))
+            self.assertEqual(1, proxy_server.purge_dns_cache("tun120"))
+            self.assertEqual(1, proxy_server.purge_dns_cache("tun121"))
+            self.assertEqual(2, query.call_count)
+
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
         class Client:
             def __init__(self):

@@ -1,0 +1,15 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 19380,
+  "poll_interval": 15,
+  "health_timeout": 8,
+  "probe_host": "api.ipify.org",
+  "probe_port": 80,
+  "state_command": [
+    "docker",
+    "exec",
+    "aimilivpn-validation",
+    "cat",
+    "/data/slots.json"
+  ]
+}

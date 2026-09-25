@@ -1,0 +1,21 @@
+[Unit]
+Description=AimiliVPN dynamic SOCKS5 pool
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/aimili-dynamic-pool
+ExecStart=/usr/bin/python3 /opt/aimili-dynamic-pool/aimili_dynamic_pool.py --config /etc/aimili-dynamic-pool/config.json
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,7 @@ LABEL org.opencontainers.image.title="AimiliVPN" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         iproute2 \
         iptables \
         openvpn \
@@ -24,6 +25,7 @@ WORKDIR /app
 COPY VERSION README.md LICENSE ./
 COPY vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py ./
 COPY mirror ./mirror
+COPY scripts/selfcheck_multiexit.sh ./scripts/selfcheck_multiexit.sh
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -35,6 +37,7 @@ ENV PYTHONUNBUFFERED=1 \
     LOCAL_PROXY_PORT=7928
 
 RUN mkdir -p /data \
+    && chmod +x /app/scripts/selfcheck_multiexit.sh \
     && python3 -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py
 
 VOLUME ["/data"]

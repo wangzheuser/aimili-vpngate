@@ -94,6 +94,14 @@ def ports_conflict(web_port: Any, proxy_port: Any) -> bool:
     except (TypeError, ValueError):
         return False
 
+
+def port_in_use(port: Any, ports: list[int] | tuple[int, ...] | set[int]) -> bool:
+    try:
+        value = int(port)
+    except (TypeError, ValueError):
+        return False
+    return value in {int(item) for item in ports}
+
 API_HTTPS_URL = os.environ.get("VPNGATE_API_HTTPS_URL", "https://www.vpngate.net/api/iphone/").strip()
 API_HTTP_URL = os.environ.get("VPNGATE_API_HTTP_URL", "http://www.vpngate.net/api/iphone/").strip()
 MIRROR_HTTPS_URL = os.environ.get(
@@ -120,6 +128,8 @@ OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
+OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", NODE_PROBE_WORKERS, 1, 64)
+TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
 PROXY_FAILURE_THRESHOLD = env_int("PROXY_FAILURE_THRESHOLD", 3, 1, 10)
 SWITCH_PREFLIGHT_MAX_AGE_SECONDS = env_int("SWITCH_PREFLIGHT_MAX_AGE_SECONDS", 180, 0, 3600)
 OPENVPN_CMD = os.environ.get("OPENVPN_CMD", "openvpn")
@@ -130,6 +140,19 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
+MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 16, 1, 64)
+DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 64)
+SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
+SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 200, 101, 60000)
+SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 65535)
+SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "127.0.0.1")
+SLOT_PROCESS_MARKER = "AIMILI_SLOT"
+EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
+SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
+SLOT_EGRESS_FAIL_THRESHOLD = env_int("SLOT_EGRESS_FAIL_THRESHOLD", 2, 1)
+SLOT_BAD_NODE_COOLDOWN = env_int("SLOT_BAD_NODE_COOLDOWN", 600, 60)
+MAIN_EGRESS_FAIL_THRESHOLD = env_int("MAIN_EGRESS_FAIL_THRESHOLD", 2, 1)
+MAIN_BAD_NODE_COOLDOWN = env_int("MAIN_BAD_NODE_COOLDOWN", 600, 60)
 DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "source").strip().lower()
 if DEPLOYMENT_MODE not in {"source", "docker"}:
     DEPLOYMENT_MODE = "source"
@@ -162,6 +185,7 @@ BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 API_CACHE_FILE = DATA_DIR / "api_snapshot.csv"
 API_CACHE_META_FILE = DATA_DIR / "api_snapshot.meta.json"
 BUNDLED_SNAPSHOT_FILE = ROOT_DIR / "mirror" / "vpngate.csv"
+SLOTS_FILE = DATA_DIR / "slots.json"
 WEB_LOG_MAX_ENTRIES = 500
 
 lock = threading.RLock()
@@ -181,6 +205,20 @@ last_active_ping_time = 0.0
 last_active_latency = 0
 consecutive_proxy_failures = 0
 last_proxy_failure_node_id = ""
+main_egress_fail_count = 0
+main_bad_nodes: dict[str, float] = {}
+main_proxy_registry = proxy_server.ConnRegistry()
+
+exit_slots_lock = threading.RLock()
+exit_slots_supervise_lock = threading.Lock()
+exit_slots: dict[int, dict[str, Any]] = {}
+exit_slot_proxy_stops: dict[int, threading.Event] = {}
+exit_slot_proxy_threads: dict[int, threading.Thread] = {}
+exit_slot_proxy_registries: dict[int, proxy_server.ConnRegistry] = {}
+slot_bad_nodes: dict[str, float] = {}
+slot_egress_fail_counts: dict[int, int] = {}
+last_exit_slots_heartbeat = 0.0
+last_slot_egress_heartbeat = 0.0
 
 last_collector_heartbeat = 0.0
 last_checker_heartbeat = 0.0
@@ -325,23 +363,41 @@ def load_ui_config() -> dict[str, Any]:
             "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
+            "routing_isp": "",
             "connection_enabled": True,
             "fixed_node_id": "",
             "favorite_node_ids": [],
             "fav_fail_fallback": False,
             "discovery_countries": [],
+            "exit_slot_active": list(range(DEFAULT_EXIT_SLOTS)),
+            "exit_slot_paused": [],
+            "exit_slot_count": DEFAULT_EXIT_SLOTS,
+            "exit_slot_country": "",
+            "exit_slot_isp": "",
+            "exit_slot_residential_only": True,
+            "exit_slot_country_map": {},
+            "exit_slot_isp_map": {},
+            "exit_slot_pin_map": {},
         }
         updated = False
+        data: dict[str, Any] = {}
         if auth_file.exists():
             try:
                 auth_file.chmod(0o600)
             except OSError:
                 pass
             try:
-                data = json.loads(auth_file.read_text(encoding="utf-8"))
+                loaded = json.loads(auth_file.read_text(encoding="utf-8"))
+                data = loaded if isinstance(loaded, dict) else {}
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
+                for key in [
+                    "host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type",
+                    "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "routing_isp",
+                    "discovery_countries", "exit_slot_active", "exit_slot_paused", "exit_slot_count",
+                    "exit_slot_country", "exit_slot_isp", "exit_slot_residential_only",
+                    "exit_slot_country_map", "exit_slot_isp_map", "exit_slot_pin_map",
+                ]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -374,6 +430,37 @@ def load_ui_config() -> dict[str, Any]:
         if normalized_discovery_countries != config.get("discovery_countries"):
             config["discovery_countries"] = normalized_discovery_countries
             updated = True
+
+        active_raw = config.get("exit_slot_active")
+        # 旧版本只保存 exit_slot_count；只有在新字段缺失时才从旧字段迁移，
+        # 避免默认值 list(range(DEFAULT_EXIT_SLOTS)) 把旧配置覆盖掉。
+        if "exit_slot_active" not in data and "exit_slot_count" in data:
+            active_raw = list(range(bounded_int(data.get("exit_slot_count"), DEFAULT_EXIT_SLOTS, 0, MAX_EXIT_SLOTS)))
+            config["exit_slot_active"] = active_raw
+            updated = True
+        elif not isinstance(active_raw, (list, tuple, set)):
+            try:
+                active_raw = list(range(bounded_int(config.get("exit_slot_count"), DEFAULT_EXIT_SLOTS, 0, MAX_EXIT_SLOTS)))
+            except Exception:
+                active_raw = list(range(DEFAULT_EXIT_SLOTS))
+            config["exit_slot_active"] = active_raw
+            updated = True
+        active = sorted({int(item) for item in active_raw if str(item).strip().lstrip("-").isdigit() and 0 <= int(item) < MAX_EXIT_SLOTS})
+        if active != list(active_raw):
+            config["exit_slot_active"] = active
+            updated = True
+        paused_raw = config.get("exit_slot_paused")
+        paused = sorted({int(item) for item in (paused_raw if isinstance(paused_raw, (list, tuple, set)) else []) if str(item).strip().lstrip("-").isdigit() and int(item) in active})
+        if paused != list(paused_raw or []):
+            config["exit_slot_paused"] = paused
+            updated = True
+        if config.get("exit_slot_count") != len(active):
+            config["exit_slot_count"] = len(active)
+            updated = True
+        for map_key in ("exit_slot_country_map", "exit_slot_isp_map", "exit_slot_pin_map"):
+            if not isinstance(config.get(map_key), dict):
+                config[map_key] = {}
+                updated = True
             
         if not auth_file.exists() or updated:
             try:
@@ -527,11 +614,17 @@ def get_state() -> dict[str, Any]:
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
+    state["routing_isp"] = ui_cfg.get("routing_isp", "")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
     state["favorite_node_ids"] = ui_cfg.get("favorite_node_ids", [])
     state["discovery_countries"] = normalize_discovery_countries(ui_cfg.get("discovery_countries"))
     state["fav_fail_fallback"] = False
+    state["multi_exit"] = {
+        "active": get_active_slots(),
+        "up": sum(1 for index in get_active_slots() if slot_process_alive(index)),
+        "max": MAX_EXIT_SLOTS,
+    }
     
     return state
 
@@ -1223,7 +1316,12 @@ def get_openvpn_version() -> float:
     _openvpn_version = 2.4
     return _openvpn_version
 
-def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> list[str]:
+def openvpn_command(
+    config_file: str,
+    route_nopull: bool,
+    dev: str = "tun0",
+    extra_args: list[str] | None = None,
+) -> list[str]:
     command = split_openvpn_command()
     command.extend(
         [
@@ -1282,6 +1380,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
         
     if route_nopull:
         command.append("--route-nopull")
+    if extra_args:
+        command.extend(extra_args)
     return command
 
 def stop_process(process: subprocess.Popen[str] | None) -> None:
@@ -1374,6 +1474,8 @@ def kill_existing_openvpn_processes() -> None:
             executable = Path(args[0]).name.lower()
             if "openvpn" not in executable and "openvpn" not in cmdline.lower():
                 continue
+            if SLOT_PROCESS_MARKER in cmdline:
+                continue
             if any(marker and marker in cmdline for marker in own_markers):
                 try:
                     os.kill(pid, signal.SIGTERM)
@@ -1424,12 +1526,14 @@ def run_openvpn_until_ready(
     dev: str = "tun0",
     cancel_event: threading.Event | None = None,
     track_pending: bool = False,
+    extra_args: list[str] | None = None,
+    report_status: bool = True,
 ) -> tuple[bool, str, subprocess.Popen[str] | None]:
     global pending_openvpn_process
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
     try:
         process = subprocess.Popen(
-            openvpn_command(config_file, route_nopull, dev),
+            openvpn_command(config_file, route_nopull, dev, extra_args),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -1461,7 +1565,7 @@ def run_openvpn_until_ready(
                 openvpn_logs.append(line_str)
                 lines.put(line_str)
             else:
-                if keep_alive:
+                if keep_alive and report_status:
                     print(f"[OpenVPN] {line_str}", flush=True)
                     level = "INFO"
                     line_lower = line_str.lower()
@@ -1495,10 +1599,10 @@ def run_openvpn_until_ready(
         if line:
             tail.append(line)
             tail = tail[-50:]
-            if keep_alive:
+            if keep_alive and report_status:
                 print(f"[OpenVPN] {line}", flush=True)
         lower = line.lower()
-        if keep_alive:
+        if keep_alive and report_status:
             update_handshake_status(lower)
         if "initialization sequence completed" in lower:
             if cancel_event is not None and cancel_event.is_set():
@@ -1541,50 +1645,65 @@ def run_openvpn_until_ready(
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> bool:
+def setup_policy_routing(interface: str = "tun0", table: int = 100) -> bool:
+    table_str = str(table)
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "rule", "del", "table", table_str], capture_output=True, timeout=2)
     except Exception:
         pass
     try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", table_str], capture_output=True, timeout=2)
     except Exception:
         pass
     
     success = False
     for attempt in range(1, 4):
+        route_added = False
+        rule_added = False
         try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
+            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", table_str], check=True, timeout=2)
+            route_added = True
+            subprocess.run(["ip", "rule", "add", "oif", interface, "table", table_str], check=True, timeout=2)
+            rule_added = True
             # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
             for proc_path in ["all", "default", interface]:
                 try:
                     subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{proc_path}.rp_filter=2"], capture_output=True, timeout=2)
                 except Exception:
                     pass
-            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
+            print(f"[policy_routing] Enabled policy routing for interface {interface} (table {table_str}, attempt {attempt} success)", flush=True)
             success = True
             break
         except Exception as e:
             print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
+            # 两步配置必须原子化；第二步失败时立即清掉第一步，避免留下
+            # 指向不存在规则的路由表并影响后续连接。
+            if route_added or rule_added:
+                try:
+                    subprocess.run(["ip", "rule", "del", "table", table_str], capture_output=True, timeout=2)
+                    subprocess.run(["ip", "route", "flush", "table", table_str], capture_output=True, timeout=2)
+                except Exception:
+                    pass
             time.sleep(1)
             
     if not success:
-        print("[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
-        log_to_json("ERROR", "Routing", "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由")
+        print(f"[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由表 {table_str} 配置失败。", flush=True)
+        log_to_json("ERROR", "Routing", f"[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由表 {table_str} 配置失败")
     return success
 
-def cleanup_policy_routing() -> None:
+def cleanup_policy_routing(table: int = 100) -> None:
+    table_str = str(table)
     try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
+        subprocess.run(["ip", "rule", "del", "table", table_str], capture_output=True, timeout=2)
+        subprocess.run(["ip", "route", "flush", "table", table_str], capture_output=True, timeout=2)
+        print(f"[policy_routing] Cleared policy routing table {table_str}", flush=True)
     except Exception:
         pass
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
     with lock:
+        reset_main_proxy_connections()
         cleanup_policy_routing()
         config_to_delete = None
         if active_openvpn_node_id:
@@ -1700,6 +1819,17 @@ def apply_routing_filters(
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         candidates = [n for n in candidates if n.get("id") in fav_ids]
 
+    routing_isp = str(ui_cfg.get("routing_isp", "") or "").strip()
+    if routing_isp:
+        keywords = _split_filter(routing_isp)
+        candidates = [
+            node for node in candidates
+            if any(
+                keyword in " ".join(str(node.get(key) or "") for key in ("owner", "as_name", "asn")).lower()
+                for keyword in keywords
+            )
+        ]
+
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
     if routing_ip_type == "residential":
         candidates = [
@@ -1782,6 +1912,13 @@ def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         if node_id not in fav_ids:
             raise RuntimeError("当前处于仅用收藏模式，不能连接未收藏节点")
+
+    routing_isp = str(ui_cfg.get("routing_isp", "") or "").strip()
+    if routing_isp:
+        keywords = _split_filter(routing_isp)
+        haystack = " ".join(str(node.get(key) or "") for key in ("owner", "as_name", "asn")).lower()
+        if not any(keyword in haystack for keyword in keywords):
+            raise RuntimeError("当前已锁定运营商过滤，节点不匹配")
 
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
     node_ip_type = node.get("ip_type")
@@ -1953,7 +2090,11 @@ def is_systemic_probe_failure(message: Any) -> bool:
         )
     )
 
-def test_multiple_nodes(node_ids: list[str], target_available: int | None = None) -> list[dict[str, Any]]:
+def test_multiple_nodes(
+    node_ids: list[str],
+    target_available: int | None = None,
+    required_node_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
@@ -2009,10 +2150,16 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
     updated_nodes_map: dict[str, dict[str, Any]] = {}
     available_count = 0
     systemic_failure = ""
+    required_node_ids = {str(node_id) for node_id in (required_node_ids or set()) if str(node_id)}
     max_workers = min(NODE_PROBE_WORKERS, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         for batch_start in range(0, len(to_test), max_workers):
-            if systemic_failure or (target_available is not None and available_count >= target_available):
+            required_complete = required_node_ids.issubset(updated_nodes_map)
+            if systemic_failure or (
+                target_available is not None
+                and available_count >= target_available
+                and required_complete
+            ):
                 break
 
             batch = to_test[batch_start : batch_start + max_workers]
@@ -2081,6 +2228,784 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         
     return list(updated_nodes_map.values())
 
+
+# ---------------------------------------------------------------------------
+# 多出口槽位
+# ---------------------------------------------------------------------------
+
+def _normalize_slot_indices(value: Any) -> list[int]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    result: set[int] = set()
+    for item in value:
+        try:
+            index = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < MAX_EXIT_SLOTS:
+            result.add(index)
+    return sorted(result)
+
+
+def get_active_slots() -> list[int]:
+    cfg = load_ui_config()
+    active = _normalize_slot_indices(cfg.get("exit_slot_active"))
+    if "exit_slot_active" not in cfg:
+        count = bounded_int(cfg.get("exit_slot_count"), DEFAULT_EXIT_SLOTS, 0, MAX_EXIT_SLOTS)
+        active = list(range(count))
+    return active
+
+
+def get_paused_slots() -> set[int]:
+    return set(_normalize_slot_indices(load_ui_config().get("exit_slot_paused")))
+
+
+def _save_slot_lists(cfg: dict[str, Any], active: list[int] | None = None, paused: set[int] | None = None) -> None:
+    if active is not None:
+        cfg["exit_slot_active"] = sorted(set(active))
+        cfg["exit_slot_count"] = len(cfg["exit_slot_active"])
+    if paused is not None:
+        cfg["exit_slot_paused"] = sorted(set(paused) & set(cfg.get("exit_slot_active", [])))
+    DATA_DIR.mkdir(exist_ok=True, parents=True)
+    write_json(DATA_DIR / "ui_auth.json", cfg)
+
+
+def slot_device(index: int) -> str:
+    return f"tun{SLOT_DEV_BASE + index}"
+
+
+def slot_table(index: int) -> int:
+    return SLOT_TABLE_BASE + index
+
+
+def slot_port(index: int) -> int:
+    return SLOT_PORT_BASE + index
+
+
+def slot_config_path(index: int) -> Path:
+    return CONFIG_DIR / f".slot_{index}.ovpn"
+
+
+def get_exit_slot_config() -> dict[str, Any]:
+    cfg = load_ui_config()
+    active = get_active_slots()
+    return {
+        "count": len(active),
+        "active": active,
+        "paused": sorted(get_paused_slots() & set(active)),
+        "country": str(cfg.get("exit_slot_country", "") or "").strip().upper(),
+        "isp": str(cfg.get("exit_slot_isp", "") or "").strip(),
+        "residential_only": bool(cfg.get("exit_slot_residential_only", True)),
+    }
+
+
+def set_exit_slot_config(
+    count: Any = None,
+    country: Any = None,
+    residential_only: Any = None,
+    isp: Any = None,
+) -> dict[str, Any]:
+    with lock:
+        cfg = load_ui_config()
+        active = paused = None
+        if count is not None:
+            count_value = bounded_int(count, DEFAULT_EXIT_SLOTS, 0, MAX_EXIT_SLOTS)
+            current_active = _normalize_slot_indices(cfg.get("exit_slot_active"))
+            if count_value < len(current_active):
+                # 缩容只移除最高索引，保留已存在槽位的端口和节点绑定。
+                active = current_active[:count_value]
+            else:
+                active = list(current_active)
+                for index in range(MAX_EXIT_SLOTS):
+                    if len(active) >= count_value:
+                        break
+                    if index not in active:
+                        active.append(index)
+                active.sort()
+            paused = get_paused_slots() & set(active)
+        if country is not None:
+            cfg["exit_slot_country"] = str(country or "").strip().upper()[:256]
+        if isp is not None:
+            cfg["exit_slot_isp"] = str(isp or "").strip()[:256]
+        if residential_only is not None:
+            cfg["exit_slot_residential_only"] = bool(residential_only)
+        _save_slot_lists(cfg, active, paused)
+    return get_exit_slot_config()
+
+
+def get_slot_country_map() -> dict[str, str]:
+    raw = load_ui_config().get("exit_slot_country_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value or "").strip().upper()[:32] for key, value in raw.items() if str(value or "").strip()}
+
+
+def get_slot_isp_map() -> dict[str, str]:
+    raw = load_ui_config().get("exit_slot_isp_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value or "").strip()[:256] for key, value in raw.items() if str(value or "").strip()}
+
+
+def get_slot_pin_map() -> dict[str, str]:
+    raw = load_ui_config().get("exit_slot_pin_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): str(value).strip() for key, value in raw.items() if str(value).strip()}
+
+
+def per_slot_country(index: int) -> str:
+    return get_slot_country_map().get(str(index), "") or get_exit_slot_config()["country"]
+
+
+def per_slot_isp(index: int) -> str:
+    return get_slot_isp_map().get(str(index), "") or get_exit_slot_config()["isp"]
+
+
+def _set_slot_map_value(map_name: str, index: int, value: Any, normalize=str) -> dict[str, str]:
+    if index < 0 or index >= MAX_EXIT_SLOTS:
+        raise ValueError("槽位超出允许范围")
+    with lock:
+        cfg = load_ui_config()
+        values = cfg.get(map_name)
+        if not isinstance(values, dict):
+            values = {}
+        normalized = normalize(value or "").strip()
+        if normalized:
+            values[str(index)] = normalized
+        else:
+            values.pop(str(index), None)
+        cfg[map_name] = values
+        _save_slot_lists(cfg)
+    return {str(key): str(value) for key, value in values.items() if str(value).strip()}
+
+
+def set_slot_country(index: int, country: Any) -> dict[str, str]:
+    return _set_slot_map_value("exit_slot_country_map", index, country, lambda value: str(value).upper()[:32])
+
+
+def set_slot_isp(index: int, isp: Any) -> dict[str, str]:
+    return _set_slot_map_value("exit_slot_isp_map", index, isp, lambda value: str(value)[:256])
+
+
+def set_slot_pin(index: int, node_id: Any) -> dict[str, str]:
+    return _set_slot_map_value("exit_slot_pin_map", index, node_id, lambda value: str(value)[:256])
+
+
+def current_slot_node_ids() -> set[str]:
+    with exit_slots_lock:
+        return {str(slot.get("node_id")) for slot in exit_slots.values() if slot.get("node_id")}
+
+
+def _slot_ip_type_allowed(node: dict[str, Any], residential_only: bool) -> bool:
+    if not residential_only:
+        return True
+    return node.get("ip_type") in ("residential", "mobile") and node.get("ip_type_confidence") in ("medium", "high")
+
+
+def _split_filter(value: str) -> list[str]:
+    return [item.strip().lower() for item in str(value or "").split(",") if item.strip()]
+
+
+def _slot_filters_match(node: dict[str, Any], country: str, residential_only: bool, isp: str = "") -> bool:
+    countries = {item.strip().upper() for item in str(country or "").split(",") if item.strip()}
+    if countries:
+        country_short = str(node.get("country_short") or "").upper()
+        if country_short not in countries and not any(
+            country_matches(node.get("country"), target, node.get("country_short"))
+            for target in countries
+        ):
+            return False
+    if not _slot_ip_type_allowed(node, residential_only):
+        return False
+    isp_keywords = _split_filter(isp)
+    if isp_keywords:
+        haystack = " ".join(str(node.get(key) or "") for key in ("owner", "as_name", "asn")).lower()
+        if not any(keyword in haystack for keyword in isp_keywords):
+            return False
+    return True
+
+
+def select_slot_nodes(
+    used_ids: set[str],
+    need: int,
+    country: str,
+    residential_only: bool,
+    isp: str = "",
+) -> list[dict[str, Any]]:
+    if need <= 0:
+        return []
+    now = time.time()
+    cooling = {node_id for node_id, until in slot_bad_nodes.items() if until > now}
+    pool: list[dict[str, Any]] = []
+    for node in read_nodes():
+        node_id = str(node.get("id") or "")
+        if not node_id or node_id in used_ids or node_id in cooling:
+            continue
+        if node.get("probe_status") != "available" or not _slot_filters_match(node, country, residential_only, isp):
+            continue
+        pool.append(node)
+    pool.sort(key=lambda node: (parse_int(node.get("latency_ms")) or 999999, -parse_int(node.get("score"))))
+    return pool[:need]
+
+
+def pick_slot_node(index: int, used_ids: set[str]) -> dict[str, Any] | None:
+    pin = get_slot_pin_map().get(str(index))
+    if pin and pin not in used_ids:
+        pinned = next((node for node in read_nodes() if node.get("id") == pin), None)
+        if pinned and pinned.get("probe_status") == "available" and _slot_ip_type_allowed(pinned, get_exit_slot_config()["residential_only"]):
+            return pinned
+    cfg = get_exit_slot_config()
+    picks = select_slot_nodes(used_ids, 1, per_slot_country(index), cfg["residential_only"], per_slot_isp(index))
+    return picks[0] if picks else None
+
+
+def pending_slot_probe_ids(nodes: list[dict[str, Any]]) -> set[str]:
+    """Return untested nodes needed to fill currently down filtered slots."""
+    cfg = get_exit_slot_config()
+    paused = get_paused_slots()
+    persisted_slots = {
+        int(slot.get("slot")): slot
+        for slot in read_json(SLOTS_FILE, {}).get("slots", [])
+        if str(slot.get("slot", "")).lstrip("-").isdigit()
+    }
+    required: set[str] = set()
+    for index in cfg["active"]:
+        persisted = persisted_slots.get(index, {})
+        persisted_up = persisted.get("status") == "up" and persisted.get("node_id")
+        country = str(persisted.get("country_filter") or per_slot_country(index)).strip()
+        isp = str(persisted.get("isp_filter") or per_slot_isp(index)).strip()
+        has_explicit_filter = bool(country or isp)
+        persisted_node = next(
+            (node for node in nodes if node.get("id") == persisted.get("node_id")),
+            None,
+        )
+        persisted_ready = bool(
+            persisted_up
+            and (
+                not has_explicit_filter
+                or (
+                    persisted_node
+                    and persisted_node.get("probe_status") == "available"
+                    and _slot_filters_match(persisted_node, country, cfg["residential_only"], isp)
+                )
+            )
+        )
+        if index in paused or persisted_ready or (not has_explicit_filter and slot_process_alive(index)):
+            continue
+        for node in nodes:
+            node_id = str(node.get("id") or "")
+            if (
+                node_id
+                and node.get("probe_status") in (None, "", "not_checked", "testing")
+                and _slot_filters_match(node, country, False, isp)
+            ):
+                required.add(node_id)
+    return required
+
+
+def slot_node_candidates(index: int, used_ids: set[str]) -> list[dict[str, Any]]:
+    """Return every currently available node matching one slot's filters."""
+    nodes = read_nodes()
+    with exit_slots_lock:
+        current_id = next(
+            (
+                str(slot.get("node_id") or "")
+                for slot in exit_slots.values()
+                if int(slot.get("slot", -1)) == index
+            ),
+            "",
+        )
+    available_ids = set(used_ids) - ({current_id} if current_id else set())
+    cfg = get_exit_slot_config()
+    return select_slot_nodes(
+        available_ids,
+        len(nodes),
+        per_slot_country(index),
+        cfg["residential_only"],
+        per_slot_isp(index),
+    )
+
+
+def kill_slot_openvpn_processes() -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return
+    killed: list[int] = []
+    try:
+        for proc_dir in proc_root.iterdir():
+            if not proc_dir.name.isdigit() or int(proc_dir.name) == os.getpid():
+                continue
+            try:
+                raw = (proc_dir / "cmdline").read_bytes()
+            except OSError:
+                continue
+            cmdline = " ".join(part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part)
+            if "openvpn" not in cmdline.lower() or SLOT_PROCESS_MARKER not in cmdline:
+                continue
+            try:
+                os.kill(int(proc_dir.name), signal.SIGTERM)
+                killed.append(int(proc_dir.name))
+            except (OSError, PermissionError):
+                pass
+        if killed:
+            time.sleep(0.5)
+            for pid in killed:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (OSError, PermissionError):
+                    pass
+        for index in range(MAX_EXIT_SLOTS):
+            cleanup_policy_routing(slot_table(index))
+    except Exception as exc:
+        print(f"[多出口] 清理遗留槽位失败: {exc}", flush=True)
+
+
+def _slot_proxy_bind_conflict(index: int) -> bool:
+    cfg = load_ui_config()
+    return slot_port(index) in {LOCAL_PROXY_PORT, bounded_int(cfg.get("port"), UI_PORT, 1, 65535)}
+
+
+def _wait_for_slot_proxy(index: int, timeout: float = 3.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", slot_port(index)), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.05)
+    return False
+
+
+def ensure_slot_proxy(index: int) -> bool:
+    with exit_slots_lock:
+        if index in exit_slot_proxy_threads and exit_slot_proxy_threads[index].is_alive():
+            return _wait_for_slot_proxy(index, 1.0)
+        stop_event = threading.Event()
+        registry = exit_slot_proxy_registries.get(index)
+        if registry is None:
+            registry = proxy_server.ConnRegistry()
+            exit_slot_proxy_registries[index] = registry
+        exit_slot_proxy_stops[index] = stop_event
+        thread = threading.Thread(
+            target=proxy_server.start_proxy_server,
+            args=(SLOT_PROXY_HOST, slot_port(index), slot_device(index), stop_event, registry),
+            name=f"aimili-slot-proxy-{index}",
+            daemon=True,
+        )
+        exit_slot_proxy_threads[index] = thread
+        thread.start()
+    ready = _wait_for_slot_proxy(index)
+    if ready:
+        return True
+    # 绑定失败时回收事件、线程引用和登记的连接，下一轮可以干净重试。
+    stop_event.set()
+    registry.close_all()
+    thread.join(timeout=2)
+    with exit_slots_lock:
+        if exit_slot_proxy_threads.get(index) is thread:
+            exit_slot_proxy_threads.pop(index, None)
+        if exit_slot_proxy_stops.get(index) is stop_event:
+            exit_slot_proxy_stops.pop(index, None)
+        exit_slot_proxy_registries.pop(index, None)
+    return False
+
+
+def bring_up_slot(index: int, node: dict[str, Any]) -> bool:
+    if _slot_proxy_bind_conflict(index):
+        mark_slot_pending(index, "槽位端口与 Web 或主代理端口冲突")
+        return False
+    config_path = slot_config_path(index)
+    try:
+        CONFIG_DIR.mkdir(exist_ok=True, parents=True)
+        config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+        ok, message, process = run_openvpn_until_ready(
+            str(config_path),
+            keep_alive=True,
+            route_nopull=True,
+            timeout=OPENVPN_TEST_TIMEOUT_SECONDS,
+            dev=slot_device(index),
+            extra_args=["--setenv", SLOT_PROCESS_MARKER, str(index)],
+            report_status=False,
+        )
+        if not ok or process is None:
+            raise RuntimeError(message)
+        if not setup_policy_routing(slot_device(index), slot_table(index)):
+            raise RuntimeError("槽位策略路由配置失败")
+        if not ensure_slot_proxy(index):
+            raise RuntimeError("槽位代理端口未能监听")
+        with exit_slots_lock:
+            exit_slots[index] = {
+                "slot": index,
+                "device": slot_device(index),
+                "table": slot_table(index),
+                "port": slot_port(index),
+                "node_id": node.get("id", ""),
+                "country": node.get("country", ""),
+                "country_short": node.get("country_short", ""),
+                "ip": node.get("ip") or node.get("remote_host", ""),
+                "ip_type": node.get("ip_type", ""),
+                "ip_type_confidence": node.get("ip_type_confidence", ""),
+                "location": node.get("location", ""),
+                "owner": node.get("owner", ""),
+                "latency_ms": node.get("latency_ms", 0),
+                "process": process,
+                "status": "up",
+                "since": time.time(),
+                "message": "",
+                "exit_ip": "",
+                "egress_ok": None,
+            }
+        log_to_json("INFO", "MultiExit", f"槽位 {index} 已就绪: {node.get('ip')}:{slot_port(index)}")
+        return True
+    except Exception as exc:
+        print(f"[多出口] 槽位 {index} 启动失败: {exc}", flush=True)
+        try:
+            stop_process(locals().get("process"))
+        except Exception:
+            pass
+        cleanup_policy_routing(slot_table(index))
+        stop_event = exit_slot_proxy_stops.pop(index, None)
+        if stop_event is not None:
+            stop_event.set()
+        registry = exit_slot_proxy_registries.pop(index, None)
+        if registry is not None:
+            registry.close_all()
+        thread = exit_slot_proxy_threads.pop(index, None)
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        try:
+            if config_path.exists():
+                config_path.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def mark_slot_pending(index: int, reason: str) -> None:
+    with exit_slots_lock:
+        exit_slots[index] = {
+            "slot": index, "device": slot_device(index), "table": slot_table(index), "port": slot_port(index),
+            "node_id": "", "country": "", "country_short": "", "ip": "", "ip_type": "",
+            "ip_type_confidence": "", "location": "", "owner": "", "latency_ms": 0,
+            "process": None, "status": "pending", "since": time.time(), "message": reason,
+            "exit_ip": "", "egress_ok": False,
+        }
+
+
+def mark_slot_paused(index: int) -> None:
+    mark_slot_pending(index, "已手动停止")
+    with exit_slots_lock:
+        exit_slots[index]["status"] = "paused"
+
+
+def tear_down_slot(index: int, stop_proxy: bool = True) -> None:
+    with exit_slots_lock:
+        slot = exit_slots.pop(index, None)
+        process = slot.get("process") if slot else None
+        stop_event = exit_slot_proxy_stops.get(index)
+        thread = exit_slot_proxy_threads.get(index)
+        registry = exit_slot_proxy_registries.get(index)
+        if stop_proxy:
+            exit_slot_proxy_stops.pop(index, None)
+            exit_slot_proxy_threads.pop(index, None)
+            exit_slot_proxy_registries.pop(index, None)
+    stop_process(process)
+    cleanup_policy_routing(slot_table(index))
+    if stop_proxy and stop_event is not None:
+        stop_event.set()
+        if registry is not None:
+            registry.close_all()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+    try:
+        path = slot_config_path(index)
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def slot_process_alive(index: int) -> bool:
+    with exit_slots_lock:
+        slot = exit_slots.get(index)
+        process = slot.get("process") if slot else None
+    return process is not None and process.poll() is None
+
+
+def write_slots_state() -> None:
+    country_map = get_slot_country_map()
+    isp_map = get_slot_isp_map()
+    with exit_slots_lock:
+        snapshot: list[dict[str, Any]] = []
+        for index in sorted(exit_slots):
+            slot = exit_slots[index]
+            process = slot.get("process")
+            alive = process is not None and process.poll() is None
+            snapshot.append({key: slot.get(key, "") for key in (
+                "slot", "device", "table", "port", "node_id", "country", "country_short", "ip",
+                "ip_type", "ip_type_confidence", "location", "owner", "latency_ms", "message",
+                "since", "exit_ip", "egress_ok"
+            )} | {"status": "up" if alive else slot.get("status", "down"), "country_filter": country_map.get(str(index), ""), "isp_filter": isp_map.get(str(index), "")})
+    cfg = get_exit_slot_config()
+    write_json(SLOTS_FILE, {
+        "schema_version": 1,
+        "updated_at": time.time(),
+        "desired_count": cfg["count"],
+        "country": cfg["country"],
+        "isp": cfg["isp"],
+        "residential_only": cfg["residential_only"],
+        "proxy_host": SLOT_PROXY_HOST,
+        "slots": snapshot,
+    })
+
+
+def supervise_exit_slots_once() -> None:
+    if not exit_slots_supervise_lock.acquire(blocking=False):
+        return
+    try:
+        active = set(get_active_slots())
+        paused = get_paused_slots() & active
+        with exit_slots_lock:
+            known = sorted(set(exit_slots) | set(exit_slot_proxy_stops))
+        for index in known:
+            if index not in active:
+                tear_down_slot(index, stop_proxy=True)
+        for index in sorted(active):
+            if index in paused:
+                if slot_process_alive(index) or index in exit_slot_proxy_stops:
+                    tear_down_slot(index, stop_proxy=True)
+                mark_slot_paused(index)
+                continue
+            if slot_process_alive(index):
+                continue
+            tear_down_slot(index, stop_proxy=False)
+            node = pick_slot_node(index, current_slot_node_ids())
+            if node and not bring_up_slot(index, node):
+                mark_slot_pending(index, f"节点 {node.get('id')} 连接失败，等待重试")
+            elif not node:
+                scope = per_slot_country(index) or "不限地区"
+                mark_slot_pending(index, f"暂无可用住宅节点（{scope}），等待节点池补齐")
+        write_slots_state()
+    finally:
+        exit_slots_supervise_lock.release()
+
+
+def switch_slot_node(index: int) -> dict[str, Any]:
+    cfg = get_exit_slot_config()
+    if index not in cfg["active"]:
+        return {"ok": False, "error": "槽位不存在"}
+    if index in cfg["paused"]:
+        return {"ok": False, "error": "槽位已停止，请先启动"}
+    if not exit_slots_supervise_lock.acquire(blocking=False):
+        return {"ok": False, "error": "供给器正忙，请稍后重试"}
+    try:
+        set_slot_pin(index, "")
+        picks = select_slot_nodes(current_slot_node_ids(), 1, per_slot_country(index), cfg["residential_only"], per_slot_isp(index))
+        if not picks:
+            return {"ok": False, "error": "没有其他符合条件的节点"}
+        tear_down_slot(index, stop_proxy=True)
+        if bring_up_slot(index, picks[0]):
+            write_slots_state()
+            return {"ok": True, "slot": index, "ip": picks[0].get("ip"), "country": picks[0].get("country")}
+        mark_slot_pending(index, "换 IP 后连接失败，等待自动重试")
+        write_slots_state()
+        return {"ok": False, "error": "切换失败，已进入自动重试"}
+    finally:
+        exit_slots_supervise_lock.release()
+
+
+def assign_node_to_slot(index: int, node_id: str) -> dict[str, Any]:
+    cfg = get_exit_slot_config()
+    if index not in cfg["active"]:
+        return {"ok": False, "error": "槽位不存在"}
+    node = next((item for item in read_nodes() if item.get("id") == str(node_id)), None)
+    with exit_slots_lock:
+        used_ids = {
+            str(slot.get("node_id"))
+            for other, slot in exit_slots.items()
+            if other != index and slot.get("node_id")
+        }
+    if not node or node.get("id") in used_ids:
+        return {"ok": False, "error": "节点不存在、当前不可用或已被其他槽位使用"}
+    candidates = slot_node_candidates(index, used_ids)
+    if not any(candidate.get("id") == node_id for candidate in candidates):
+        return {"ok": False, "error": "节点不符合当前槽位的国家、ISP 或 IP 类型筛选条件"}
+    with exit_slots_lock:
+        if any(other != index and slot.get("node_id") == node_id for other, slot in exit_slots.items()):
+            return {"ok": False, "error": "该节点已被其他槽位使用"}
+    if not exit_slots_supervise_lock.acquire(blocking=False):
+        return {"ok": False, "error": "供给器正忙，请稍后重试"}
+    try:
+        set_slot_pin(index, node_id)
+        tear_down_slot(index, stop_proxy=True)
+        if bring_up_slot(index, node):
+            write_slots_state()
+            return {"ok": True, "slot": index, "ip": node.get("ip"), "country": node.get("country")}
+        mark_slot_pending(index, "指定节点连接失败，等待自动重试")
+        write_slots_state()
+        return {"ok": False, "error": "指定节点连接失败"}
+    finally:
+        exit_slots_supervise_lock.release()
+
+
+def add_one_slot() -> dict[str, Any]:
+    with lock:
+        active = get_active_slots()
+        if len(active) >= MAX_EXIT_SLOTS:
+            return {"ok": False, "error": f"已达到最大槽位数 {MAX_EXIT_SLOTS}"}
+        index = next(i for i in range(MAX_EXIT_SLOTS) if i not in active)
+        cfg = load_ui_config()
+        _save_slot_lists(cfg, active=active + [index])
+    threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+    return {"ok": True, "slot": index, "port": slot_port(index), "message": f"已新增槽位 #{index}"}
+
+
+def add_slot_with_node(node_id: str) -> dict[str, Any]:
+    with lock:
+        active = get_active_slots()
+        if len(active) >= MAX_EXIT_SLOTS:
+            return {"ok": False, "error": f"已达到最大槽位数 {MAX_EXIT_SLOTS}"}
+        index = next(i for i in range(MAX_EXIT_SLOTS) if i not in active)
+        cfg = load_ui_config()
+        _save_slot_lists(cfg, active=active + [index])
+    result = assign_node_to_slot(index, str(node_id or ""))
+    if result.get("ok"):
+        result["message"] = f"已新增槽位 #{index} 并锁定节点"
+    return result
+
+
+def stop_slot(index: int) -> dict[str, Any]:
+    if index not in get_active_slots():
+        return {"ok": False, "error": "槽位不存在"}
+    with lock:
+        cfg = load_ui_config()
+        paused = get_paused_slots()
+        paused.add(index)
+        _save_slot_lists(cfg, paused=paused)
+    tear_down_slot(index, stop_proxy=True)
+    mark_slot_paused(index)
+    write_slots_state()
+    return {"ok": True, "message": f"已停止槽位 #{index}"}
+
+
+def start_slot(index: int) -> dict[str, Any]:
+    if index not in get_active_slots():
+        return {"ok": False, "error": "槽位不存在"}
+    with lock:
+        cfg = load_ui_config()
+        paused = get_paused_slots()
+        paused.discard(index)
+        _save_slot_lists(cfg, paused=paused)
+    threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+    return {"ok": True, "message": f"已启动槽位 #{index}"}
+
+
+def delete_slot(index: int) -> dict[str, Any]:
+    active = get_active_slots()
+    if index not in active:
+        return {"ok": False, "error": "槽位不存在"}
+    with lock:
+        cfg = load_ui_config()
+        cfg.get("exit_slot_country_map", {}).pop(str(index), None)
+        cfg.get("exit_slot_isp_map", {}).pop(str(index), None)
+        cfg.get("exit_slot_pin_map", {}).pop(str(index), None)
+        _save_slot_lists(cfg, active=[item for item in active if item != index], paused=get_paused_slots() - {index})
+    tear_down_slot(index, stop_proxy=True)
+    write_slots_state()
+    return {"ok": True, "message": f"已删除槽位 #{index}"}
+
+
+def check_slot_egress(port: int) -> tuple[bool, str]:
+    for url in ("http://ip.sb", "http://api.ipify.org"):
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "--proxy", f"socks5h://127.0.0.1:{port}", "--max-time", "6", url],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            ip = (result.stdout or "").strip()
+            if result.returncode == 0 and ip and len(ip) <= 64:
+                return True, ip
+        except Exception:
+            pass
+    return False, ""
+
+
+def slot_egress_checker_loop() -> None:
+    global last_slot_egress_heartbeat
+    time.sleep(20)
+    while True:
+        last_slot_egress_heartbeat = time.time()
+        try:
+            paused = get_paused_slots()
+            pin_map = get_slot_pin_map()
+            for index in get_active_slots():
+                if index in paused or not slot_process_alive(index):
+                    continue
+                ok, exit_ip = check_slot_egress(slot_port(index))
+                with exit_slots_lock:
+                    slot = exit_slots.get(index)
+                    if slot is None:
+                        continue
+                    slot["exit_ip"] = exit_ip if ok else ""
+                    slot["egress_ok"] = ok
+                    node_id = str(slot.get("node_id") or "")
+                if ok:
+                    slot_egress_fail_counts[index] = 0
+                    continue
+                slot_egress_fail_counts[index] = slot_egress_fail_counts.get(index, 0) + 1
+                if slot_egress_fail_counts[index] < SLOT_EGRESS_FAIL_THRESHOLD:
+                    continue
+                slot_egress_fail_counts[index] = 0
+                if node_id:
+                    slot_bad_nodes[node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
+                if pin_map.get(str(index)):
+                    with exit_slots_lock:
+                        if index in exit_slots:
+                            exit_slots[index]["message"] = "锁定节点出口不通，请手动换 IP"
+                    continue
+                tear_down_slot(index, stop_proxy=True)
+                threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+            write_slots_state()
+        except Exception as exc:
+            print(f"[多出口] 出口健康检查异常: {exc}", flush=True)
+        time.sleep(SLOT_EGRESS_CHECK_INTERVAL)
+
+
+def exit_slots_loop() -> None:
+    global last_exit_slots_heartbeat
+    while True:
+        last_exit_slots_heartbeat = time.time()
+        try:
+            supervise_exit_slots_once()
+        except Exception as exc:
+            print(f"[多出口] 供给器异常: {exc}", flush=True)
+        time.sleep(EXIT_SLOTS_CHECK_INTERVAL)
+
+
+def build_3xui_outbounds() -> dict[str, Any]:
+    with exit_slots_lock:
+        live = [dict(slot) for index, slot in sorted(exit_slots.items()) if slot_process_alive(index)]
+    outbounds = []
+    rules = []
+    for slot in live:
+        tag = f"res-{slot['slot']}-{(slot.get('country_short') or 'xx').lower()}"
+        outbounds.append({
+            "tag": tag,
+            "protocol": "socks",
+            "settings": {"servers": [{"address": SLOT_PROXY_HOST, "port": slot["port"]}]},
+        })
+        rules.append({"type": "field", "inboundTag": [f"inbound-{slot['slot']}"], "outboundTag": tag})
+    return {
+        "_note": "将 outbounds 合并到 Xray 配置，并把 inboundTag 替换为实际入站标签。",
+        "outbounds": outbounds,
+        "routing": {"rules": rules},
+    }
+
 def cancel_background_refill() -> None:
     background_refill_cancel_event.set()
 
@@ -2119,6 +3044,19 @@ def schedule_background_refill() -> bool:
         background_refill_thread.start()
         return True
 
+def main_bad_node_ids() -> set[str]:
+    now = time.time()
+    for node_id, until in list(main_bad_nodes.items()):
+        if until <= now:
+            main_bad_nodes.pop(node_id, None)
+    return {node_id for node_id, until in main_bad_nodes.items() if until > now}
+
+
+def mark_main_bad_node(node_id: str) -> None:
+    if node_id:
+        main_bad_nodes[node_id] = time.time() + MAIN_BAD_NODE_COOLDOWN
+
+
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
@@ -2146,6 +3084,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             n for n in nodes 
             if n.get("probe_status") == "available" 
             and not n.get("active")
+            and n.get("id") not in main_bad_node_ids()
         ]
         candidates = apply_routing_filters(candidates, ui_cfg)
             
@@ -2346,6 +3285,8 @@ def connect_node(node_id: str) -> str:
         if not res["ok"]:
             route_note = "；策略路由配置失败" if not routing_ready else ""
             raise RuntimeError(f"VPN 隧道已建立但代理出口不可用{route_note}: {res.get('error', '未知错误')}")
+        if previous_node_id and previous_node_id != node_id:
+            reset_main_proxy_connections()
 
         latest_ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, latest_ui_cfg)
@@ -2527,12 +3468,26 @@ def maintain_valid_nodes(force: bool = False) -> str:
         if should_fast_connect:
             with lock:
                 current_nodes = read_nodes()
+                required_slot_ids = pending_slot_probe_ids(current_nodes)
                 fast_candidates = [
                     n for n in current_nodes
                     if not n.get("active") and n.get("probe_status") != "unavailable"
                 ]
                 fast_candidates = apply_routing_filters(fast_candidates, ui_cfg, include_unknown_ip_type=True)
-                fast_candidates.sort(key=probe_priority_key)
+                existing_ids = {str(node.get("id") or "") for node in fast_candidates}
+                fast_candidates.extend(
+                    node
+                    for node in current_nodes
+                    if str(node.get("id") or "") in required_slot_ids - existing_ids
+                    and not node.get("active")
+                    and node.get("probe_status") != "unavailable"
+                )
+                fast_candidates.sort(
+                    key=lambda node: (
+                        0 if str(node.get("id") or "") in required_slot_ids else 1,
+                        *probe_priority_key(node),
+                    )
+                )
                 fast_test_ids = [
                     n["id"] for n in fast_candidates
                     if n.get("id")
@@ -2571,6 +3526,18 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     set_state(is_connecting=False, last_check_message="快速首连已找到可用节点，正在建立连接...")
                     auto_switch_node()
                     if active_openvpn_running():
+                        remaining_required = required_slot_ids - initial_tested_ids
+                        if remaining_required and not systemic_probe_failure:
+                            print(
+                                f"[槽位探测] 快速首连后继续检测待补槽位节点 {len(remaining_required)} 个",
+                                flush=True,
+                            )
+                            slot_results = test_multiple_nodes(
+                                sorted(remaining_required),
+                                target_available=None,
+                                required_node_ids=remaining_required,
+                            )
+                            fast_results.extend(slot_results)
                         valid_nodes_count = len([n for n in read_nodes() if n.get("probe_status") == "available"])
                         message = f"Fetched {len(candidates)} nodes. Fast-tested {len(fast_results)} nodes and connected."
                         set_state(
@@ -2597,15 +3564,37 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     if not n.get("active") and n.get("id") not in initial_tested_ids
                 ]
                 to_test = apply_routing_filters(to_test, ui_cfg, include_unknown_ip_type=True)
-                to_test.sort(key=probe_priority_key)
+                required_slot_ids = pending_slot_probe_ids(current_nodes)
+                existing_ids = {str(node.get("id") or "") for node in to_test}
+                to_test.extend(
+                    node
+                    for node in current_nodes
+                    if str(node.get("id") or "") in required_slot_ids - existing_ids
+                    and not node.get("active")
+                )
+                to_test.sort(
+                    key=lambda node: (
+                        0 if str(node.get("id") or "") in required_slot_ids else 1,
+                        *probe_priority_key(node),
+                    )
+                )
                 to_test_ids = [n["id"] for n in to_test]
+                if required_slot_ids:
+                    print(
+                        f"[槽位探测] 当前待补槽位候选 {len(required_slot_ids)} 个，已加入本轮检测队列",
+                        flush=True,
+                    )
 
             msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
             print(f"[周期检测] {msg}", flush=True)
             log_to_json("INFO", "Main", msg)
 
             set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-            tested_results = test_multiple_nodes(to_test_ids, target_available=TARGET_VALID_NODES)
+            tested_results = test_multiple_nodes(
+                to_test_ids,
+                target_available=None if required_slot_ids else TARGET_VALID_NODES,
+                required_node_ids=required_slot_ids,
+            )
         is_connecting = False
         
         with lock:
@@ -4264,6 +5253,9 @@ INDEX_HTML = r"""<!doctype html>
       <option value="residential">住宅IP</option>
       <option value="hosting">机房IP</option>
     </select>
+    <button id="btn_exit_slots" class="toolbar-btn" type="button" onclick="toggleExitSlotsPanel()" style="height: 42px; gap: 6px;">
+      <span aria-hidden="true">↗</span> 多出口住宅 IP
+    </button>
     <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
         <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
@@ -4296,6 +5288,22 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+
+  <section id="exit_slots_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:16px;">
+      <div>
+        <div style="font-size:15px; font-weight:700; color:var(--text-primary);">多出口住宅 IP</div>
+        <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">每个槽位拥有独立 TUN、策略路由和代理端口，可直接给 3x-ui 使用。</div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="toolbar-btn" type="button" onclick="addExitSlot()">新增槽位</button>
+        <button class="toolbar-btn" type="button" onclick="download3xuiOutbounds()">下载 3x-ui 出站</button>
+        <button class="toolbar-btn" type="button" onclick="loadExitSlots(true)">刷新</button>
+      </div>
+    </div>
+    <div id="exit_slots_config" style="display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-bottom:16px; padding:12px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px;"></div>
+    <div id="exit_slots_list" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px;"></div>
+  </section>
 
   <div class="table-wrapper">
     <div class="table-container">
@@ -4443,6 +5451,10 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-desc">普通机房</div>
               </button>
             </div>
+          </div>
+          <div class="form-group" style="margin-bottom: 16px;">
+            <label class="form-label" for="net_routing_isp">运营商 ISP 过滤（可选，逗号分隔）</label>
+            <input type="text" id="net_routing_isp" class="input-field" maxlength="256" placeholder="例如 NTT, So-net">
           </div>
           
           <div id="net_routing_warning" style="font-size: 12px; color: var(--text-secondary); line-height: 1.4; padding: 8px 12px; background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 6px; margin-top: 8px;">
@@ -4623,6 +5635,10 @@ let discoveryCountriesInitialized = false;
 let discoveryCountriesDirty = false;
 let countryFilterSignature = "";
 let lastNodesSnapshotSignature = "";
+let exitSlotsVisible = false;
+let exitSlotsPollTimer = null;
+let exitSlotsRequestInFlight = false;
+let exitSlotsSnapshot = {config: {count: 0, active: [], paused: []}, slots: []};
 
 const $=id=>document.getElementById(id);
 const esc=s=>String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
@@ -5699,6 +6715,183 @@ function updateFavPanelUI() {
   }
 }
 
+function toggleExitSlotsPanel() {
+  exitSlotsVisible = !exitSlotsVisible;
+  const panel = $("exit_slots_panel");
+  const button = $("btn_exit_slots");
+  if (panel) panel.style.display = exitSlotsVisible ? "block" : "none";
+  if (button) button.classList.toggle("active", exitSlotsVisible);
+  if (exitSlotsVisible) {
+    loadExitSlots(true);
+    if (!exitSlotsPollTimer) exitSlotsPollTimer = setInterval(() => loadExitSlots(false), 5000);
+  } else if (exitSlotsPollTimer) {
+    clearInterval(exitSlotsPollTimer);
+    exitSlotsPollTimer = null;
+  }
+}
+
+function exitSlotStatusText(slot) {
+  const status = String(slot && slot.status || "down");
+  if (status === "up" && slot.egress_ok === true) return "运行中 · 出口正常";
+  if (status === "up") return "运行中 · 出口检测中";
+  if (status === "paused") return "已停止";
+  if (status === "pending") return "等待节点";
+  return "未运行";
+}
+
+async function exitSlotAction(path, payload = {}) {
+  const response = await fetchWithTimeout(`./api/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }, 30000);
+  return readJsonResponse(response, "多出口操作失败");
+}
+
+function exitSlotNodeOptions(slot, usedIds, candidateNodes = null) {
+  const current = String(slot && slot.node_id || "");
+  const source = Array.isArray(candidateNodes) ? candidateNodes : nodes;
+  const candidates = source.filter(node => node && node.probe_status === "available" &&
+    (!usedIds.has(String(node.id)) || String(node.id) === current));
+  const options = [`<option value="">选择可用节点...</option>`];
+  candidates.forEach(node => {
+    const label = `${node.country_short || "--"} ${node.ip || node.remote_host || node.id} · ${node.owner || node.as_name || "未知 ISP"}`;
+    options.push(`<option value="${esc(node.id)}" ${String(node.id) === current ? "selected" : ""}>${esc(label)}</option>`);
+  });
+  return options.join("");
+}
+
+function renderExitSlots(data) {
+  exitSlotsSnapshot = data || {config: {count: 0, active: [], paused: []}, slots: []};
+  const cfg = exitSlotsSnapshot.config || {};
+  const configBox = $("exit_slots_config");
+  if (configBox) {
+    configBox.innerHTML = `
+      <label class="form-label" style="margin:0;">槽位数 <input id="exit_slots_count" class="input-field" type="number" min="0" max="${Number(data.max_slots || 16)}" value="${Number(cfg.count || 0)}" style="width:90px; height:34px; display:inline-block; margin-left:6px;"></label>
+      <label class="form-label" style="margin:0;">默认国家 <input id="exit_slots_country" class="input-field" maxlength="256" value="${esc(cfg.country || "")}" placeholder="US,JP" style="width:130px; height:34px; display:inline-block; margin-left:6px;"></label>
+      <label class="form-label" style="margin:0;">默认 ISP <input id="exit_slots_isp" class="input-field" maxlength="256" value="${esc(cfg.isp || "")}" placeholder="NTT" style="width:150px; height:34px; display:inline-block; margin-left:6px;"></label>
+      <label class="form-label" style="display:flex; align-items:center; gap:6px; margin:0; height:34px;"><input id="exit_slots_residential" type="checkbox" ${cfg.residential_only !== false ? "checked" : ""}> 仅住宅/移动 IP</label>
+      <button class="btn-primary" type="button" style="height:34px; padding:0 14px;" onclick="saveExitSlotsConfig()">保存筛选</button>
+    `;
+  }
+  const list = $("exit_slots_list");
+  if (!list) return;
+  const slots = Array.isArray(data.slots) ? data.slots : [];
+  const usedIds = new Set(slots.map(slot => String(slot.node_id || "")).filter(Boolean));
+  if (!slots.length) {
+    list.innerHTML = `<div style="color:var(--text-secondary); padding:20px; text-align:center; border:1px dashed var(--border-color); border-radius:10px;">尚未启用多出口槽位，点击“新增槽位”或设置槽位数。</div>`;
+    return;
+  }
+  list.innerHTML = slots.map(slot => {
+    const index = Number(slot.slot);
+    const paused = String(slot.status) === "paused";
+    const statusClass = String(slot.status) === "up" && slot.egress_ok === true ? "available" : (paused ? "not_checked" : "testing");
+    const nodeText = slot.node_id ? `${slot.country_short || "--"} ${slot.ip || ""} · ${slot.node_id}` : "未分配节点";
+    const countryFilter = slot.country_filter || data.country_map?.[String(index)] || "";
+    const ispFilter = slot.isp_filter || data.isp_map?.[String(index)] || "";
+    return `
+      <article style="border:1px solid var(--border-color); border-radius:12px; padding:14px; background:rgba(255,255,255,0.02);">
+        <div style="display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:8px;">
+          <strong style="color:var(--text-primary);">槽位 #${index} · ${esc(slot.device || "tun")}</strong>
+          <span class="badge ${statusClass}">${esc(exitSlotStatusText(slot))}</span>
+        </div>
+        <div style="font-size:12px; color:var(--text-secondary); line-height:1.6;">
+          代理：<span class="mono">${esc(data.proxy_host || "127.0.0.1")}:${Number(slot.port || ((data.port_base || 17928) + index))}</span><br>
+          节点：${esc(nodeText)}<br>
+          出口：${esc(slot.exit_ip || "-")} ${slot.message ? `· ${esc(slot.message)}` : ""}
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
+          <input id="slot_country_${index}" class="input-field" maxlength="32" value="${esc(countryFilter)}" placeholder="国家，如 JP" style="height:32px; width:90px;">
+          <input id="slot_isp_${index}" class="input-field" maxlength="256" value="${esc(ispFilter)}" placeholder="ISP 关键词" style="height:32px; width:130px;">
+          <button class="test-btn" type="button" onclick="saveSlotFilter(${index})">保存筛选</button>
+        </div>
+        <div style="display:flex; gap:6px; margin-top:8px;">
+           <select id="slot_node_${index}" class="input-field" style="height:32px; flex:1; min-width:0; padding:0 6px;">${exitSlotNodeOptions(slot, usedIds, data.slot_candidates?.[String(index)])}</select>
+          <button class="test-btn" type="button" onclick="assignExitSlotNode(${index})">指派</button>
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
+          ${paused ? `<button class="connect-btn" type="button" onclick="slotAction('start_slot', ${index})">启动</button>` : `<button class="test-btn" type="button" onclick="slotAction('stop_slot', ${index})">停止</button>`}
+          <button class="test-btn" type="button" onclick="slotAction('switch_exit_slot', ${index})">手动换 IP</button>
+          <button class="test-btn" type="button" style="color:var(--danger);" onclick="deleteExitSlot(${index})">删除</button>
+        </div>
+      </article>`;
+  }).join("");
+}
+
+async function loadExitSlots(force = false) {
+  if ((!exitSlotsVisible && !force) || exitSlotsRequestInFlight) return;
+  exitSlotsRequestInFlight = true;
+  try {
+    const response = await fetchWithTimeout("./api/exit_slots", {cache: "no-store"}, 15000);
+    const data = await readJsonResponse(response, "加载多出口状态失败");
+    renderExitSlots(data);
+  } catch (error) {
+    const list = $("exit_slots_list");
+    if (list && exitSlotsVisible) list.innerHTML = `<div style="color:var(--danger); padding:16px;">${esc(error.message || "加载失败")}</div>`;
+  } finally {
+    exitSlotsRequestInFlight = false;
+  }
+}
+
+async function saveExitSlotsConfig() {
+  const count = Number($("exit_slots_count")?.value || 0);
+  const country = $("exit_slots_country")?.value.trim() || "";
+  const isp = $("exit_slots_isp")?.value.trim() || "";
+  const residentialOnly = Boolean($("exit_slots_residential")?.checked);
+  try {
+    await exitSlotAction("update_exit_slots", {count, country, isp, residential_only: residentialOnly});
+    await loadExitSlots(true);
+  } catch (error) { alert(error.message || "保存多出口配置失败"); }
+}
+
+async function addExitSlot() {
+  try { await exitSlotAction("add_slot"); await loadExitSlots(true); }
+  catch (error) { alert(error.message || "新增槽位失败"); }
+}
+
+async function slotAction(action, index) {
+  try { await exitSlotAction(action, {slot: index}); await loadExitSlots(true); }
+  catch (error) { alert(error.message || "槽位操作失败"); }
+}
+
+async function saveSlotFilter(index) {
+  try {
+    await exitSlotAction("set_slot_country", {slot: index, country: $(
+      `slot_country_${index}`).value.trim()});
+    await exitSlotAction("set_slot_isp", {slot: index, isp: $(
+      `slot_isp_${index}`).value.trim()});
+    await loadExitSlots(true);
+  } catch (error) { alert(error.message || "保存槽位筛选失败"); }
+}
+
+async function assignExitSlotNode(index) {
+  const nodeId = $(
+    `slot_node_${index}`).value;
+  if (!nodeId) { alert("请选择要指派的节点"); return; }
+  try { await exitSlotAction("assign_slot_node", {slot: index, node_id: nodeId}); await loadExitSlots(true); }
+  catch (error) { alert(error.message || "指派节点失败"); }
+}
+
+async function deleteExitSlot(index) {
+  if (!confirm(`确定删除槽位 #${index} 吗？`)) return;
+  try { await exitSlotAction("delete_slot", {slot: index}); await loadExitSlots(true); }
+  catch (error) { alert(error.message || "删除槽位失败"); }
+}
+
+async function download3xuiOutbounds() {
+  try {
+    const response = await fetchWithTimeout("./api/exit_slots/3xui", {cache: "no-store"}, 15000);
+    const data = await readJsonResponse(response, "导出 3x-ui 出站失败");
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type: "application/json"});
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "aimili-3xui-outbounds.json";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  } catch (error) { alert(error.message || "导出失败"); }
+}
+
 async function toggleFavRouting() {
   if (!state) return;
   const newMode = state.routing_mode === "favorites" ? "auto" : "favorites";
@@ -5953,6 +7146,7 @@ function openNetworkModal() {
     $("net_proxy_port").value = state.proxy_port || 7928;
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
+    $("net_routing_isp").value = state.routing_isp || "";
     
     selectOptionCard('routing_mode', mode);
     selectOptionCard('routing_ip_type', ipType);
@@ -5980,6 +7174,7 @@ async function saveNetwork(e) {
   const routingMode = $("net_routing_mode").value;
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
+  const routingIsp = $("net_routing_isp").value.trim().slice(0, 256);
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -6015,7 +7210,8 @@ async function saveNetwork(e) {
         proxy_port: proxyPort,
         routing_mode: routingMode,
         force_country: forceCountry,
-        routing_ip_type: routingIpType
+         routing_ip_type: routingIpType,
+         routing_isp: routingIsp
       })
     }, 25000);
     const data = await readJsonResponse(res, "保存代理设置失败");
@@ -6412,6 +7608,18 @@ def check_proxy_health() -> dict[str, Any]:
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
 
+
+def reset_main_proxy_connections() -> None:
+    global main_egress_fail_count
+    main_egress_fail_count = 0
+    try:
+        closed = main_proxy_registry.close_all()
+        purged = proxy_server.purge_dns_cache("tun0")
+        if closed or purged:
+            log_to_json("INFO", "Proxy", f"主连接切换后清理下游连接 {closed} 条、DNS 缓存 {purged} 条")
+    except Exception as exc:
+        print(f"[主代理] 重置下游连接失败: {exc}", flush=True)
+
 def reset_proxy_failure_counter(node_id: str = "") -> None:
     global consecutive_proxy_failures, last_proxy_failure_node_id
     with lock:
@@ -6479,6 +7687,7 @@ def background_proxy_checker() -> None:
                     ui_cfg = load_ui_config()
                     routing_mode = ui_cfg.get("routing_mode", "auto")
                     if routing_mode != "fixed_ip":
+                        mark_main_bad_node(checked_node_id)
                         with lock:
                             nodes = read_nodes()
                             active_node = next((n for n in nodes if n.get("id") == checked_node_id), None)
@@ -6676,6 +7885,37 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_bytes(node["config_text"].encode("utf-8"), "application/x-openvpn-profile")
             else:
                 self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+        elif effective_path == "/api/exit_slots":
+            slots_state = read_json(SLOTS_FILE, {"slots": [], "updated_at": 0})
+            cfg = get_exit_slot_config()
+            slots = slots_state.get("slots", [])
+            used_ids = {
+                str(slot.get("node_id") or "")
+                for slot in slots
+                if slot.get("node_id")
+            }
+            slot_candidates: dict[str, list[dict[str, Any]]] = {}
+            for index in cfg["active"]:
+                public_nodes = []
+                for node in slot_node_candidates(index, used_ids):
+                    public_node = node.copy()
+                    public_node.pop("config_text", None)
+                    public_nodes.append(public_node)
+                slot_candidates[str(index)] = public_nodes
+            self.send_json({
+                "config": cfg,
+                "max_slots": MAX_EXIT_SLOTS,
+                "proxy_host": SLOT_PROXY_HOST,
+                "port_base": SLOT_PORT_BASE,
+                "country_map": get_slot_country_map(),
+                "isp_map": get_slot_isp_map(),
+                "pin_map": get_slot_pin_map(),
+                "slots": slots,
+                "slot_candidates": slot_candidates,
+                "updated_at": slots_state.get("updated_at", 0),
+            })
+        elif effective_path == "/api/exit_slots/3xui":
+            self.send_json(build_3xui_outbounds())
         elif effective_path == "/api/gateway_status":
             web_ui_status = {
                 "name": "Web 管理服务",
@@ -6930,6 +8170,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                routing_isp = str(payload.get("routing_isp") or "").strip()[:256]
                 
                 try:
                     new_proxy_port_int = int(new_proxy_port)
@@ -6964,6 +8205,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["routing_isp"] = routing_isp
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = False
                 if routing_mode == "fixed_ip":
@@ -6999,6 +8241,7 @@ class Handler(BaseHTTPRequestHandler):
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
                 force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
+                routing_isp = str(payload.get("routing_isp") or "").strip()[:256]
                 fav_fail_fallback = False
                 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
@@ -7020,6 +8263,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
+                ui_cfg["routing_isp"] = routing_isp
                 ui_cfg["fav_fail_fallback"] = fav_fail_fallback
                 if routing_mode == "fixed_ip":
                     ui_cfg["fixed_node_id"] = fixed_node_id
@@ -7066,6 +8310,65 @@ class Handler(BaseHTTPRequestHandler):
                     policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "收藏列表已更新")
                 
                 self.send_json({"ok": True, "favorite_node_ids": fav_ids, "message": policy_message or ""})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path == "/api/update_exit_slots":
+            try:
+                payload = self.read_json_body()
+                count = payload.get("count")
+                if count is not None and not str(count).strip().lstrip("-").isdigit():
+                    self.send_json({"ok": False, "error": "槽位数量必须为整数"}, HTTPStatus.BAD_REQUEST)
+                    return
+                cfg = set_exit_slot_config(
+                    count=int(count) if count is not None else None,
+                    country=payload.get("country"),
+                    isp=payload.get("isp"),
+                    residential_only=payload.get("residential_only"),
+                )
+                threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+                self.send_json({"ok": True, "config": cfg, "message": "多出口配置已更新，正在调整槽位"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        if effective_path in ("/api/set_slot_country", "/api/set_slot_isp", "/api/switch_exit_slot", "/api/assign_slot_node", "/api/add_slot_with_node", "/api/stop_slot", "/api/start_slot", "/api/delete_slot", "/api/add_slot"):
+            try:
+                payload = self.read_json_body()
+                if effective_path == "/api/add_slot":
+                    result = add_one_slot()
+                elif effective_path == "/api/add_slot_with_node":
+                    result = add_slot_with_node(str(payload.get("node_id") or ""))
+                else:
+                    raw_slot = payload.get("slot")
+                    if raw_slot is None or not str(raw_slot).strip().lstrip("-").isdigit():
+                        self.send_json({"ok": False, "error": "缺少有效槽位号"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    index = int(raw_slot)
+                    if index < 0 or index >= MAX_EXIT_SLOTS:
+                        self.send_json({"ok": False, "error": f"槽位号必须在 0 至 {MAX_EXIT_SLOTS - 1} 之间"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    if effective_path == "/api/set_slot_country":
+                        country_map = set_slot_country(index, payload.get("country"))
+                        threading.Thread(target=switch_slot_node, args=(index,), daemon=True).start()
+                        result = {"ok": True, "country_map": country_map, "message": "槽位地区已更新，正在切换节点"}
+                    elif effective_path == "/api/set_slot_isp":
+                        isp_map = set_slot_isp(index, payload.get("isp"))
+                        threading.Thread(target=switch_slot_node, args=(index,), daemon=True).start()
+                        result = {"ok": True, "isp_map": isp_map, "message": "槽位 ISP 已更新，正在切换节点"}
+                    elif effective_path == "/api/switch_exit_slot":
+                        result = switch_slot_node(index)
+                    elif effective_path == "/api/assign_slot_node":
+                        result = assign_node_to_slot(index, str(payload.get("node_id") or ""))
+                    elif effective_path == "/api/stop_slot":
+                        result = stop_slot(index)
+                    elif effective_path == "/api/start_slot":
+                        result = start_slot(index)
+                    else:
+                        result = delete_slot(index)
+                status = HTTPStatus.OK if result.get("ok") else HTTPStatus.CONFLICT
+                self.send_json(result, status)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -7260,6 +8563,7 @@ class Tee:
 def main() -> None:
     ensure_dirs()
     kill_existing_openvpn_processes()
+    kill_slot_openvpn_processes()
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -7288,7 +8592,12 @@ def main() -> None:
             "blacklisted_nodes": 0,
         },
     )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
+    threading.Thread(
+        target=proxy_server.start_proxy_server,
+        args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT, "tun0", None, main_proxy_registry),
+        name="aimili-main-proxy",
+        daemon=True,
+    ).start()
     
     # Wait for the gateway to officially start
     print("[网关] 正在启动代理网关...", flush=True)
@@ -7337,6 +8646,8 @@ def main() -> None:
     threading.Thread(target=ip_enrichment_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
+    threading.Thread(target=exit_slots_loop, name="aimili-exit-slots", daemon=True).start()
+    threading.Thread(target=slot_egress_checker_loop, name="aimili-slot-egress", daemon=True).start()
     
     ui_cfg = load_ui_config()
     ui_host = ui_cfg.get("host", UI_HOST)
