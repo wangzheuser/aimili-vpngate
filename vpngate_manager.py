@@ -125,6 +125,7 @@ MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 API_FETCH_TIMEOUT_SECONDS = env_int("API_FETCH_TIMEOUT_SECONDS", 10, 1, 60)
 API_SOURCE_DEADLINE_SECONDS = env_int("API_SOURCE_DEADLINE_SECONDS", 6, 2, 30)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
+SLOT_OPERATION_LOCK_TIMEOUT_SECONDS = env_int("SLOT_OPERATION_LOCK_TIMEOUT_SECONDS", 60, 1, 180)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
 NODE_PROBE_WORKERS = env_int("NODE_PROBE_WORKERS", 5, 1, 20)
@@ -2808,7 +2809,13 @@ def supervise_exit_slots_once() -> None:
             tear_down_slot(index, stop_proxy=False)
             node = pick_slot_node(index, current_slot_node_ids())
             if node and not bring_up_slot(index, node):
-                mark_slot_pending(index, f"节点 {node.get('id')} 连接失败，等待重试")
+                node_id = str(node.get("id") or "")
+                if not get_slot_pin_map().get(str(index)) and node_id:
+                    slot_bad_nodes[node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
+                    reason = f"节点 {node_id} 连接失败，已冷却，自动选择其他节点"
+                else:
+                    reason = f"节点 {node_id} 连接失败，等待重试"
+                mark_slot_pending(index, reason)
             elif not node:
                 scope = per_slot_country(index) or "不限地区"
                 mark_slot_pending(index, f"暂无可用住宅节点（{scope}），等待节点池补齐")
@@ -2823,8 +2830,8 @@ def switch_slot_node(index: int) -> dict[str, Any]:
         return {"ok": False, "error": "槽位不存在"}
     if index in cfg["paused"]:
         return {"ok": False, "error": "槽位已停止，请先启动"}
-    if not exit_slots_supervise_lock.acquire(blocking=False):
-        return {"ok": False, "error": "供给器正忙，请稍后重试"}
+    if not exit_slots_supervise_lock.acquire(timeout=SLOT_OPERATION_LOCK_TIMEOUT_SECONDS):
+        return {"ok": False, "error": "供给器持续忙碌，请稍后重试"}
     try:
         set_slot_pin(index, "")
         picks = select_slot_nodes(current_slot_node_ids(), 1, per_slot_country(index), cfg["residential_only"], per_slot_isp(index))
@@ -2860,8 +2867,8 @@ def assign_node_to_slot(index: int, node_id: str) -> dict[str, Any]:
     with exit_slots_lock:
         if any(other != index and slot.get("node_id") == node_id for other, slot in exit_slots.items()):
             return {"ok": False, "error": "该节点已被其他槽位使用"}
-    if not exit_slots_supervise_lock.acquire(blocking=False):
-        return {"ok": False, "error": "供给器正忙，请稍后重试"}
+    if not exit_slots_supervise_lock.acquire(timeout=SLOT_OPERATION_LOCK_TIMEOUT_SECONDS):
+        return {"ok": False, "error": "供给器持续忙碌，请稍后重试"}
     try:
         set_slot_pin(index, node_id)
         tear_down_slot(index, stop_proxy=True)
@@ -5156,6 +5163,117 @@ INDEX_HTML = r"""<!doctype html>
       line-height: 1.3;
     }
 
+    .exit-slots-config {
+      display: grid !important;
+      grid-template-columns: repeat(4, minmax(0, auto)) minmax(96px, auto);
+      gap: 10px;
+      align-items: center;
+    }
+
+    .exit-slots-grid {
+      display: grid !important;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 12px;
+      align-items: stretch;
+      align-content: start;
+    }
+
+    .exit-slot-card {
+      min-width: 0;
+      min-height: 312px;
+      height: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      padding: 14px;
+      background: rgba(255,255,255,0.02);
+      box-sizing: border-box;
+    }
+
+    .exit-slot-header {
+      min-height: 28px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .exit-slot-title {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .exit-slot-details {
+      min-height: 76px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.6;
+    }
+
+    .exit-slot-detail-line {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .exit-slot-filter-row,
+    .exit-slot-assignment-row {
+      display: grid;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .exit-slot-filter-row {
+      grid-template-columns: minmax(0, 90px) minmax(0, 1fr) auto;
+      min-height: 32px;
+      margin-top: 10px;
+    }
+
+    .exit-slot-assignment-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 32px;
+      margin-top: 8px;
+    }
+
+    .exit-slot-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      min-height: 32px;
+      margin-top: auto;
+      padding-top: 10px;
+    }
+
+    @media (max-width: 760px) {
+      .exit-slots-config {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .exit-slots-config button {
+        width: 100%;
+      }
+    }
+
+    @media (max-width: 420px) {
+      .exit-slots-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .exit-slot-filter-row {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      }
+
+      .exit-slot-filter-row button {
+        grid-column: 1 / -1;
+      }
+    }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after {
         animation-duration: 0.01ms !important;
@@ -5325,8 +5443,8 @@ INDEX_HTML = r"""<!doctype html>
         <button class="toolbar-btn" type="button" onclick="loadExitSlots(true)">刷新</button>
       </div>
     </div>
-    <div id="exit_slots_config" style="display:flex; gap:10px; flex-wrap:wrap; align-items:end; margin-bottom:16px; padding:12px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px;"></div>
-    <div id="exit_slots_list" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px;"></div>
+    <div id="exit_slots_config" class="exit-slots-config" style="margin-bottom:16px; padding:12px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px;"></div>
+    <div id="exit_slots_list" class="exit-slots-grid"></div>
   </section>
 
   <div class="table-wrapper">
@@ -6763,12 +6881,12 @@ function exitSlotStatusText(slot) {
   return "未运行";
 }
 
-async function exitSlotAction(path, payload = {}) {
+async function exitSlotAction(path, payload = {}, timeoutMs = 30000) {
   const response = await fetchWithTimeout(`./api/${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  }, 30000);
+  }, timeoutMs);
   return readJsonResponse(response, "多出口操作失败");
 }
 
@@ -6791,9 +6909,9 @@ function renderExitSlots(data) {
   const configBox = $("exit_slots_config");
   if (configBox) {
     configBox.innerHTML = `
-      <label class="form-label" style="margin:0;">槽位数 <input id="exit_slots_count" class="input-field" type="number" min="0" max="${Number(data.max_slots || 64)}" value="${Number(cfg.count || 0)}" style="width:90px; height:34px; display:inline-block; margin-left:6px;"></label>
-      <label class="form-label" style="margin:0;">默认国家 <input id="exit_slots_country" class="input-field" maxlength="256" value="${esc(cfg.country || "")}" placeholder="US,JP" style="width:130px; height:34px; display:inline-block; margin-left:6px;"></label>
-      <label class="form-label" style="margin:0;">默认 ISP <input id="exit_slots_isp" class="input-field" maxlength="256" value="${esc(cfg.isp || "")}" placeholder="NTT" style="width:150px; height:34px; display:inline-block; margin-left:6px;"></label>
+      <label class="form-label" style="margin:0;">槽位数 <input id="exit_slots_count" class="input-field" type="number" min="0" max="${Number(data.max_slots || 64)}" value="${Number(cfg.count || 0)}"></label>
+      <label class="form-label" style="margin:0;">默认国家 <input id="exit_slots_country" class="input-field" maxlength="256" value="${esc(cfg.country || "")}" placeholder="US,JP"></label>
+      <label class="form-label" style="margin:0;">默认 ISP <input id="exit_slots_isp" class="input-field" maxlength="256" value="${esc(cfg.isp || "")}" placeholder="NTT"></label>
       <label class="form-label" style="display:flex; align-items:center; gap:6px; margin:0; height:34px;"><input id="exit_slots_residential" type="checkbox" ${cfg.residential_only !== false ? "checked" : ""}> 仅住宅/移动 IP</label>
       <button class="btn-primary" type="button" style="height:34px; padding:0 14px;" onclick="saveExitSlotsConfig()">保存筛选</button>
     `;
@@ -6810,30 +6928,31 @@ function renderExitSlots(data) {
     const index = Number(slot.slot);
     const paused = String(slot.status) === "paused";
     const statusClass = String(slot.status) === "up" && slot.egress_ok === true ? "available" : (paused ? "not_checked" : "testing");
-    const nodeText = slot.node_id ? `${slot.country_short || "--"} ${slot.ip || ""} · ${slot.node_id}` : "未分配节点";
+    const nodeText = slot.node_id ? `${slot.country_short || "--"} ${slot.ip || slot.node_id} · ${slot.owner || "未知 ISP"}` : "未分配节点";
+    const nodeTitle = slot.node_id || nodeText;
     const countryFilter = slot.country_filter || data.country_map?.[String(index)] || "";
     const ispFilter = slot.isp_filter || data.isp_map?.[String(index)] || "";
     return `
-      <article style="border:1px solid var(--border-color); border-radius:12px; padding:14px; background:rgba(255,255,255,0.02);">
-        <div style="display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:8px;">
-          <strong style="color:var(--text-primary);">槽位 #${index} · ${esc(slot.device || "tun")}</strong>
+      <article class="exit-slot-card">
+        <div class="exit-slot-header">
+          <strong class="exit-slot-title" style="color:var(--text-primary);">槽位 #${index} · ${esc(slot.device || "tun")}</strong>
           <span class="badge ${statusClass}">${esc(exitSlotStatusText(slot))}</span>
         </div>
-        <div style="font-size:12px; color:var(--text-secondary); line-height:1.6;">
-          代理：<span class="mono">${esc(data.proxy_host || "127.0.0.1")}:${Number(slot.port || ((data.port_base || 17928) + index))}</span><br>
-          节点：${esc(nodeText)}<br>
-          出口：${esc(slot.exit_ip || "-")} ${slot.message ? `· ${esc(slot.message)}` : ""}
+        <div class="exit-slot-details">
+          <div class="exit-slot-detail-line">代理：<span class="mono">${esc(data.proxy_host || "127.0.0.1")}:${Number(slot.port || ((data.port_base || 17928) + index))}</span></div>
+          <div class="exit-slot-detail-line" title="${esc(nodeTitle)}">节点：${esc(nodeText)}</div>
+          <div class="exit-slot-detail-line">出口：${esc(slot.exit_ip || "-")} ${slot.message ? `· ${esc(slot.message)}` : ""}</div>
         </div>
-        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
-          <input id="slot_country_${index}" class="input-field" maxlength="32" value="${esc(countryFilter)}" placeholder="国家，如 JP" style="height:32px; width:90px;">
-          <input id="slot_isp_${index}" class="input-field" maxlength="256" value="${esc(ispFilter)}" placeholder="ISP 关键词" style="height:32px; width:130px;">
+        <div class="exit-slot-filter-row">
+          <input id="slot_country_${index}" class="input-field" maxlength="32" value="${esc(countryFilter)}" placeholder="国家，如 JP">
+          <input id="slot_isp_${index}" class="input-field" maxlength="256" value="${esc(ispFilter)}" placeholder="ISP 关键词">
           <button class="test-btn" type="button" onclick="saveSlotFilter(${index})">保存筛选</button>
         </div>
-        <div style="display:flex; gap:6px; margin-top:8px;">
-           <select id="slot_node_${index}" class="input-field" style="height:32px; flex:1; min-width:0; padding:0 6px;">${exitSlotNodeOptions(slot, usedIds, data.slot_candidates?.[String(index)])}</select>
+        <div class="exit-slot-assignment-row">
+           <select id="slot_node_${index}" class="input-field" style="height:32px; min-width:0; padding:0 6px;">${exitSlotNodeOptions(slot, usedIds, data.slot_candidates?.[String(index)])}</select>
           <button class="test-btn" type="button" onclick="assignExitSlotNode(${index})">指派</button>
         </div>
-        <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:10px;">
+        <div class="exit-slot-actions">
           ${paused ? `<button class="connect-btn" type="button" onclick="slotAction('start_slot', ${index})">启动</button>` : `<button class="test-btn" type="button" onclick="slotAction('stop_slot', ${index})">停止</button>`}
           <button class="test-btn" type="button" onclick="slotAction('switch_exit_slot', ${index})">手动换 IP</button>
           <button class="test-btn" type="button" style="color:var(--danger);" onclick="deleteExitSlot(${index})">删除</button>
@@ -6892,7 +7011,7 @@ async function assignExitSlotNode(index) {
   const nodeId = $(
     `slot_node_${index}`).value;
   if (!nodeId) { alert("请选择要指派的节点"); return; }
-  try { await exitSlotAction("assign_slot_node", {slot: index, node_id: nodeId}); await loadExitSlots(true); }
+  try { await exitSlotAction("assign_slot_node", {slot: index, node_id: nodeId}, 70000); await loadExitSlots(true); }
   catch (error) { alert(error.message || "指派节点失败"); }
 }
 

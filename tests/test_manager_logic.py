@@ -1151,6 +1151,72 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(["kr-good"], [node["id"] for node in candidates])
 
+    def test_auto_slot_failure_cools_node_and_selects_next_candidate(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [
+                {
+                    "id": "bad-node",
+                    "ip": "192.0.2.10",
+                    "probe_status": "available",
+                    "country_short": "JP",
+                    "ip_type": "residential",
+                    "ip_type_confidence": "high",
+                    "latency_ms": 10,
+                    "score": 1000,
+                },
+                {
+                    "id": "good-node",
+                    "ip": "192.0.2.11",
+                    "probe_status": "available",
+                    "country_short": "JP",
+                    "ip_type": "residential",
+                    "ip_type_confidence": "high",
+                    "latency_ms": 20,
+                    "score": 900,
+                },
+            ],
+        )
+        manager._save_slot_lists(manager.load_ui_config(), active=[0])
+        manager.exit_slots.clear()
+        manager.slot_bad_nodes.clear()
+
+        with (
+            mock.patch.object(manager, "slot_process_alive", return_value=False),
+            mock.patch.object(manager, "tear_down_slot"),
+            mock.patch.object(manager, "bring_up_slot", return_value=False),
+            mock.patch.object(manager, "write_slots_state"),
+        ):
+            manager.supervise_exit_slots_once()
+
+        self.assertIn("bad-node", manager.slot_bad_nodes)
+        self.assertEqual("good-node", manager.pick_slot_node(0, set())["id"])
+
+    def test_assign_waits_for_supplier_lock_with_bounded_timeout(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [{
+                "id": "assignable",
+                "ip": "192.0.2.20",
+                "probe_status": "available",
+                "country_short": "JP",
+                "ip_type": "residential",
+                "ip_type_confidence": "high",
+            }],
+        )
+        manager._save_slot_lists(manager.load_ui_config(), active=[0])
+        manager.exit_slots.clear()
+        manager.exit_slots[0] = {"slot": 0, "node_id": ""}
+        fake_lock = mock.Mock()
+        fake_lock.acquire.return_value = False
+
+        with mock.patch.object(manager, "exit_slots_supervise_lock", fake_lock):
+            result = manager.assign_node_to_slot(0, "assignable")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("持续忙碌", result["error"])
+        fake_lock.acquire.assert_called_once_with(timeout=manager.SLOT_OPERATION_LOCK_TIMEOUT_SECONDS)
+
     def test_pending_slot_probe_includes_unclassified_nodes(self) -> None:
         manager.write_json(
             manager.NODES_FILE,
