@@ -48,6 +48,48 @@ class FakeProcess:
         self.running = False
 
 
+class PolicyRoutingTests(unittest.TestCase):
+    def test_cleanup_does_not_flush_missing_table(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+            manager.cleanup_policy_routing(263)
+
+        self.assertNotIn(["ip", "route", "flush", "table", "263"], calls)
+
+    def test_cleanup_flushes_existing_table(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if command[:4] == ["ip", "route", "show", "table"]:
+                return mock.Mock(returncode=0, stdout="default dev tun120\n")
+            return mock.Mock(returncode=0, stdout="")
+
+        with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+            manager.cleanup_policy_routing(200)
+
+        self.assertIn(["ip", "route", "flush", "table", "200"], calls)
+
+    def test_reserved_route_tables_are_never_flushed(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout="default dev eth0\n")
+
+        with mock.patch.object(manager.subprocess, "run", side_effect=fake_run):
+            manager.cleanup_policy_routing(254)
+            manager.cleanup_policy_routing(255)
+
+        self.assertNotIn(["ip", "route", "flush", "table", "254"], calls)
+        self.assertNotIn(["ip", "route", "flush", "table", "255"], calls)
+
+
 def valid_snapshot_rows(rows: list[tuple[str, str, str]]) -> str:
     csv_rows = [
         "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,OpenVPN_ConfigData_Base64"

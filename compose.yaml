@@ -23,9 +23,9 @@ services:
       LOCAL_PROXY_PORT: "7928"
       # 多出口槽位：每个槽位使用 tun${SLOT_DEV_BASE+n}、table ${SLOT_TABLE_BASE+n}、port ${SLOT_PORT_BASE+n}
       MULTI_EXIT_SLOTS: "0"
-      MAX_EXIT_SLOTS: "16"
+      MAX_EXIT_SLOTS: "64"
       SLOT_DEV_BASE: "120"
-      SLOT_TABLE_BASE: "200"
+      SLOT_TABLE_BASE: "300"
       SLOT_PORT_BASE: "17928"
       SLOT_PROXY_HOST: "127.0.0.1"
       EXIT_SLOTS_CHECK_INTERVAL: "30"

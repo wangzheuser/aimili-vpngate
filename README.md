@@ -201,7 +201,7 @@ curl --proxy socks5h://127.0.0.1:7928 https://api.ipify.org
 | 配置项 | 默认值 | 槽位 `n` 的实际资源 |
 | --- | --- | --- |
 | `SLOT_DEV_BASE` | `120` | `tun(120+n)` |
-| `SLOT_TABLE_BASE` | `200` | 路由表 `200+n` |
+| `SLOT_TABLE_BASE` | `300` | 路由表 `300+n`（避开 Linux 保留表 `253-255`） |
 | `SLOT_PORT_BASE` | `17928` | `127.0.0.1:17928+n` |
 | `MULTI_EXIT_SLOTS` | `0` | 默认启用的槽位数 |
 

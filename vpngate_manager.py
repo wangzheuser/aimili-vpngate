@@ -140,12 +140,13 @@ LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
 UI_HOST = os.environ.get("UI_HOST", "::")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
-MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 16, 1, 64)
+MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 64, 1, 64)
 DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 64)
 SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
-SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 200, 101, 60000)
+SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 300, 101, 60000)
 SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 65535)
 SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "127.0.0.1")
+RESERVED_ROUTE_TABLES = frozenset({0, 253, 254, 255})
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
 EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
@@ -1645,16 +1646,39 @@ def run_openvpn_until_ready(
     return ok, message, process
 
 
+def _flush_policy_route_table(table: int) -> None:
+    """Flush only an existing custom table; missing tables must not touch local routes."""
+    table_str = str(table)
+    if int(table) in RESERVED_ROUTE_TABLES:
+        return
+    try:
+        existing = subprocess.run(
+            ["ip", "route", "show", "table", table_str],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if existing.returncode != 0 or not existing.stdout.strip():
+            return
+        subprocess.run(
+            ["ip", "route", "flush", "table", table_str],
+            capture_output=True,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
 def setup_policy_routing(interface: str = "tun0", table: int = 100) -> bool:
     table_str = str(table)
+    if int(table) in RESERVED_ROUTE_TABLES:
+        print(f"[路由配置失败] [错误代码 3003] 保留路由表 {table_str} 不可用于槽位策略路由。", flush=True)
+        return False
     try:
         subprocess.run(["ip", "rule", "del", "table", table_str], capture_output=True, timeout=2)
     except Exception:
         pass
-    try:
-        subprocess.run(["ip", "route", "flush", "table", table_str], capture_output=True, timeout=2)
-    except Exception:
-        pass
+    _flush_policy_route_table(table)
     
     success = False
     for attempt in range(1, 4):
@@ -1695,7 +1719,7 @@ def cleanup_policy_routing(table: int = 100) -> None:
     table_str = str(table)
     try:
         subprocess.run(["ip", "rule", "del", "table", table_str], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", table_str], capture_output=True, timeout=2)
+        _flush_policy_route_table(table)
         print(f"[policy_routing] Cleared policy routing table {table_str}", flush=True)
     except Exception:
         pass
@@ -6767,7 +6791,7 @@ function renderExitSlots(data) {
   const configBox = $("exit_slots_config");
   if (configBox) {
     configBox.innerHTML = `
-      <label class="form-label" style="margin:0;">槽位数 <input id="exit_slots_count" class="input-field" type="number" min="0" max="${Number(data.max_slots || 16)}" value="${Number(cfg.count || 0)}" style="width:90px; height:34px; display:inline-block; margin-left:6px;"></label>
+      <label class="form-label" style="margin:0;">槽位数 <input id="exit_slots_count" class="input-field" type="number" min="0" max="${Number(data.max_slots || 64)}" value="${Number(cfg.count || 0)}" style="width:90px; height:34px; display:inline-block; margin-left:6px;"></label>
       <label class="form-label" style="margin:0;">默认国家 <input id="exit_slots_country" class="input-field" maxlength="256" value="${esc(cfg.country || "")}" placeholder="US,JP" style="width:130px; height:34px; display:inline-block; margin-left:6px;"></label>
       <label class="form-label" style="margin:0;">默认 ISP <input id="exit_slots_isp" class="input-field" maxlength="256" value="${esc(cfg.isp || "")}" placeholder="NTT" style="width:150px; height:34px; display:inline-block; margin-left:6px;"></label>
       <label class="form-label" style="display:flex; align-items:center; gap:6px; margin:0; height:34px;"><input id="exit_slots_residential" type="checkbox" ${cfg.residential_only !== false ? "checked" : ""}> 仅住宅/移动 IP</label>
