@@ -3078,11 +3078,30 @@ def delete_slot(index: int) -> dict[str, Any]:
     return {"ok": True, "message": f"已删除槽位 #{index}"}
 
 
-def check_slot_egress(port: int) -> tuple[bool, str]:
+def check_slot_egress(index: int) -> tuple[bool, str]:
+    """Check a slot's public egress through its listener-level credentials."""
+    port = slot_port(index)
+    credentials = get_slot_auth(index)
+    proxy_user = None
+    if credentials is not None:
+        proxy_user = f"{credentials[0]}:{credentials[1]}"
     for url in ("http://ip.sb", "http://api.ipify.org"):
         try:
+            command = [
+                "curl",
+                "-s",
+                "--noproxy",
+                "",
+                "--proxy",
+                f"socks5h://127.0.0.1:{port}",
+                "--max-time",
+                "6",
+            ]
+            if proxy_user is not None:
+                command.extend(["--proxy-user", proxy_user])
+            command.append(url)
             result = subprocess.run(
-                ["curl", "-s", "--proxy", f"socks5h://127.0.0.1:{port}", "--max-time", "6", url],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=8,
@@ -3106,7 +3125,7 @@ def slot_egress_checker_loop() -> None:
             for index in get_active_slots():
                 if index in paused or not slot_process_alive(index):
                     continue
-                ok, exit_ip = check_slot_egress(slot_port(index))
+                ok, exit_ip = check_slot_egress(index)
                 with exit_slots_lock:
                     slot = exit_slots.get(index)
                     if slot is None:

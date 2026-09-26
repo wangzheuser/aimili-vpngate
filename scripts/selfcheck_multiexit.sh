@@ -28,7 +28,10 @@ try:
     payload = json.load(open(sys.argv[1], encoding='utf-8'))
     for slot in payload.get('slots', []):
         if isinstance(slot, dict) and str(slot.get('status', '')) in ('up', 'pending'):
-            print(int(slot.get('slot', -1)))
+            index = int(slot.get('slot', -1))
+            username = str(slot.get('proxy_username') or '')
+            password = str(slot.get('proxy_password') or '')
+            print(f'{index}|{username}|{password}')
 except Exception:
     pass
 PY
@@ -39,7 +42,7 @@ if [ -z "$active_slots" ]; then
   for ((i=0; i<configured && i<MAX_EXIT_SLOTS; i++)); do active_slots="${active_slots}${i}"$'\n'; done
 fi
 
-while IFS= read -r index; do
+while IFS='|' read -r index proxy_username proxy_password; do
   [ -n "$index" ] || continue
   case "$index" in
     ''|*[!0-9]*) continue ;;
@@ -60,7 +63,11 @@ while IFS= read -r index; do
   fi
 
   if command -v curl >/dev/null 2>&1; then
-    exit_ip="$(curl --noproxy '' --max-time 12 -fsS -x "http://${SLOT_PROXY_HOST}:${port}" https://api.ipify.org 2>/dev/null || true)"
+    curl_args=(--noproxy '' --max-time 12 -fsS -x "http://${SLOT_PROXY_HOST}:${port}")
+    if [ -n "$proxy_username" ] && [ -n "$proxy_password" ]; then
+      curl_args+=(--proxy-user "${proxy_username}:${proxy_password}")
+    fi
+    exit_ip="$(curl "${curl_args[@]}" https://api.ipify.org 2>/dev/null || true)"
     if printf '%s' "$exit_ip" | grep -Eq '^[0-9a-fA-F:.]+$'; then log "槽位 $index: 真实出口 IP $exit_ip"; else fail "槽位 $index: 无法通过代理获取真实出口 IP"; fi
   else
     fail "缺少 curl 命令，无法检查槽位 $index 的真实出口"

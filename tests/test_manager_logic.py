@@ -181,6 +181,11 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("data-value=\"favorites\"", manager.INDEX_HTML)
         self.assertIn("set_slot_auth", manager.INDEX_HTML)
 
+    def test_multiexit_selfcheck_supports_slot_credentials(self) -> None:
+        script = (manager.ROOT_DIR / "scripts" / "selfcheck_multiexit.sh").read_text(encoding="utf-8")
+        self.assertIn("proxy_username", script)
+        self.assertIn("--proxy-user", script)
+
     def write_nodes(self, count: int) -> list[dict]:
         nodes = []
         for index in range(count):
@@ -1269,6 +1274,19 @@ class ManagerLogicTests(unittest.TestCase):
         calls = [call.args[0] for call in run_mock.call_args_list]
         self.assertIn(["ip", "route", "add", "default", "dev", "tun123", "table", "456"], calls)
         self.assertIn(["ip", "rule", "add", "oif", "tun123", "table", "456"], calls)
+
+    def test_slot_egress_check_uses_listener_credentials(self) -> None:
+        manager.set_slot_auth(0, "admin", "admin2012")
+        result = mock.Mock(returncode=0, stdout="203.0.113.10\n")
+        with mock.patch.object(manager.subprocess, "run", return_value=result) as run_mock:
+            ok, exit_ip = manager.check_slot_egress(0)
+
+        self.assertTrue(ok)
+        self.assertEqual("203.0.113.10", exit_ip)
+        command = run_mock.call_args.args[0]
+        self.assertIn(["--noproxy", ""], [command[index:index + 2] for index in range(len(command) - 1)])
+        self.assertIn(["--proxy-user", "admin:admin2012"], [command[index:index + 2] for index in range(len(command) - 1)])
+        self.assertIn("socks5h://127.0.0.1:17929", command)
 
     def test_slot_port_index_remains_stable_after_delete(self) -> None:
         cfg = manager.load_ui_config()
