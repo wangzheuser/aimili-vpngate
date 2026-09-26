@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import logging
 import os
@@ -42,8 +43,14 @@ class Slot:
     password: str = ""
 
 
-def _valid_loopback_host(host: str) -> bool:
-    return host in {"127.0.0.1", "::1", "localhost"}
+def _valid_listen_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
 
 
 def _slot_from_json(item: Any) -> Slot | None:
@@ -421,8 +428,8 @@ class SocksPoolServer:
 def load_config(path: str) -> dict[str, Any]:
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     host = str(config.get("listen_host", "127.0.0.1"))
-    if not _valid_loopback_host(host):
-        raise ValueError("listen_host must remain loopback-only")
+    if not _valid_listen_host(host):
+        raise ValueError("listen_host must be localhost or a valid IP address")
     port = int(config.get("listen_port", 17928))
     if not 1024 <= port <= 65535:
         raise ValueError("listen_port must be between 1024 and 65535")

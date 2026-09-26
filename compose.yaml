@@ -19,7 +19,7 @@ services:
       VPNGATE_DATA_DIR: /data
       UI_HOST: "0.0.0.0"
       UI_PORT: "8787"
-      LOCAL_PROXY_HOST: "127.0.0.1"
+      LOCAL_PROXY_HOST: "0.0.0.0"
       LOCAL_PROXY_PORT: "7928"
       # 多出口槽位：每个槽位使用 tun${SLOT_DEV_BASE+n}、table ${SLOT_TABLE_BASE+n}、port ${SLOT_PORT_BASE+n}
       MULTI_EXIT_SLOTS: "0"
@@ -27,7 +27,9 @@ services:
       SLOT_DEV_BASE: "120"
       SLOT_TABLE_BASE: "300"
       SLOT_PORT_BASE: "17929"
-      SLOT_PROXY_HOST: "127.0.0.1"
+      SLOT_PROXY_HOST: "0.0.0.0"
+      # 对外订阅地址与监听地址分离；公网部署时设置为服务器公网 IP 或 DNS。
+      SLOT_PROXY_ADVERTISE_HOST: "${SLOT_PROXY_ADVERTISE_HOST:-127.0.0.1}"
       EXIT_SLOTS_CHECK_INTERVAL: "30"
       SLOT_EGRESS_CHECK_INTERVAL: "45"
       SLOT_EGRESS_FAIL_THRESHOLD: "2"

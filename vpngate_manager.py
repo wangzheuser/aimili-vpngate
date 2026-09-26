@@ -147,6 +147,9 @@ SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
 SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 300, 101, 60000)
 SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17929, 1024, 65535)
 SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "127.0.0.1")
+SLOT_PROXY_ADVERTISE_HOST = os.environ.get("SLOT_PROXY_ADVERTISE_HOST", "").strip() or (
+    "127.0.0.1" if SLOT_PROXY_HOST in {"0.0.0.0", "::", ""} else SLOT_PROXY_HOST
+)
 RESERVED_ROUTE_TABLES = frozenset({0, 253, 254, 255})
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
 EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
@@ -2908,7 +2911,7 @@ def write_slots_state() -> None:
             "username": load_ui_config().get("dynamic_pool_username", ""),
             "password": load_ui_config().get("dynamic_pool_password", ""),
         },
-        "proxy_host": SLOT_PROXY_HOST,
+        "proxy_host": SLOT_PROXY_ADVERTISE_HOST,
         "slots": snapshot,
     })
 
@@ -3154,7 +3157,7 @@ def build_3xui_outbounds() -> dict[str, Any]:
         outbounds.append({
             "tag": tag,
             "protocol": "socks",
-            "settings": {"servers": [{"address": SLOT_PROXY_HOST, "port": slot["port"]}]},
+            "settings": {"servers": [{"address": SLOT_PROXY_ADVERTISE_HOST, "port": slot["port"]}]},
         })
         rules.append({"type": "field", "inboundTag": [f"inbound-{slot['slot']}"], "outboundTag": tag})
     return {
@@ -8298,7 +8301,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "config": cfg,
                 "max_slots": MAX_EXIT_SLOTS,
-                "proxy_host": SLOT_PROXY_HOST,
+                "proxy_host": SLOT_PROXY_ADVERTISE_HOST,
                 "port_base": SLOT_PORT_BASE,
                 "country_map": get_slot_country_map(),
                 "isp_map": get_slot_isp_map(),

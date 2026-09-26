@@ -202,12 +202,12 @@ curl --proxy socks5h://127.0.0.1:7928 https://api.ipify.org
 | --- | --- | --- |
 | `SLOT_DEV_BASE` | `120` | `tun(120+n)` |
 | `SLOT_TABLE_BASE` | `300` | 路由表 `300+n`（避开 Linux 保留表 `253-255`） |
-| `SLOT_PORT_BASE` | `17929` | `127.0.0.1:17929+n` |
+| `SLOT_PORT_BASE` | `17929` | `${SLOT_PROXY_HOST}:17929+n` |
 | `MULTI_EXIT_SLOTS` | `0` | 默认启用的槽位数 |
 
 面板支持槽位启停、删除、手动换 IP、国家/ISP 筛选和指定节点。住宅模式只接受 `residential`/`mobile` 且可信度为中或高的节点；未满足证据阈值的节点会被排除。点击“下载 3x-ui 出站”可导出当前真实运行槽位的 `socks` outbounds。
 
-容器部署可以在 `compose.yaml` 中调整 `MULTI_EXIT_SLOTS`、`MAX_EXIT_SLOTS`、`SLOT_*` 及健康检查间隔。宿主机必须提供 `/dev/net/tun`、`NET_ADMIN`、`NET_RAW` 和策略路由能力。部署后可运行只读自检：
+容器部署可以在 `compose.yaml` 中调整 `MULTI_EXIT_SLOTS`、`MAX_EXIT_SLOTS`、`SLOT_*` 及健康检查间隔。宿主机必须提供 `/dev/net/tun`、`NET_ADMIN`、`NET_RAW` 和策略路由能力。公网部署时将 `SLOT_PROXY_HOST` 设为 `0.0.0.0`，并将 `SLOT_PROXY_ADVERTISE_HOST` 设为公网 IP 或 DNS；Docker 容器可通过宿主机网关访问这些端口。部署后可运行只读自检：
 
 ```bash
 docker exec aimilivpn bash /app/scripts/selfcheck_multiexit.sh
@@ -223,7 +223,7 @@ VPNGATE_DATA_DIR="$PWD/vpngate_data" bash scripts/selfcheck_multiexit.sh
 
 动态池是独立的 SOCKS5 服务，会周期读取槽位状态，只选择 `status=up` 且
 `egress_ok=true` 的槽位；每条连接在建立时固定一个出口。默认仅监听
-`127.0.0.1:17928`，不会替换或改写现有 `127.0.0.1:7928` 的 `aimili-vpngate`。
+`0.0.0.0:17928`，不会替换或改写现有 `7928` 的 `aimili-vpngate`。
 管理后台的“代理设置”可以为主代理和动态池分别设置 SOCKS5 用户名/密码；
 每个多出口槽位也可以设置独立凭据。动态池对外使用池凭据，对内连接槽位时
 自动使用对应槽位凭据，留空账号和密码表示关闭认证。3x-ui 的 SOCKS 出站
@@ -234,7 +234,7 @@ python3 scripts/aimili_dynamic_pool.py \
   --config deploy/aimili-dynamic-pool/config.validation.json
 ```
 
-接入 3x-ui 时新增一个指向 `127.0.0.1:17928` 的 SOCKS outbound，再将独立 canary
+接入同机 3x-ui 时新增一个指向 `127.0.0.1:17928` 的 SOCKS outbound；公网客户端则使用服务器公网 IP 的 `17928`。再将独立 canary
 入站路由到该 outbound。增量脚本、systemd 单元和定向回滚命令见
 `deploy/aimili-dynamic-pool/README.md`。
 
@@ -268,7 +268,7 @@ print(response.text)
 
 ### 6. 从电脑或其他设备连接
 
-代理默认只监听 VPS 回环地址。推荐使用 SSH 隧道，不要直接暴露代理端口：
+默认部署可仅监听 VPS 回环地址；公网部署必须同时启用认证、限制云安全组/主机防火墙来源，并开放 `7928`、`17928`、`17929-17992`：
 
 ```bash
 ssh -N \
