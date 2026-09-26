@@ -145,7 +145,7 @@ MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 64, 1, 64)
 DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 64)
 SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
 SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 300, 101, 60000)
-SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 65535)
+SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17929, 1024, 65535)
 SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "127.0.0.1")
 RESERVED_ROUTE_TABLES = frozenset({0, 253, 254, 255})
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
@@ -352,6 +352,31 @@ def normalize_discovery_countries(value: Any) -> list[str]:
             break
     return normalized
 
+
+def normalize_proxy_credential(value: Any) -> str:
+    """Normalize a displayed proxy credential without logging its value."""
+    raw = str(value or "")
+    if len(raw) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise ValueError("代理账号密码长度或字符不符合要求")
+    return raw.strip()
+
+
+def normalize_proxy_credentials(username: Any, password: Any) -> tuple[str, str]:
+    user = normalize_proxy_credential(username)
+    secret = normalize_proxy_credential(password)
+    if bool(user) != bool(secret):
+        raise ValueError("代理账号和密码必须同时填写，或同时清空")
+    return user, secret
+
+
+def apply_main_proxy_credentials(username: str, password: str) -> None:
+    if username and password:
+        os.environ["LOCAL_PROXY_USER"] = username
+        os.environ["LOCAL_PROXY_PASS"] = password
+    else:
+        os.environ.pop("LOCAL_PROXY_USER", None)
+        os.environ.pop("LOCAL_PROXY_PASS", None)
+
 def load_ui_config() -> dict[str, Any]:
     with lock:
         auth_file = DATA_DIR / "ui_auth.json"
@@ -362,6 +387,10 @@ def load_ui_config() -> dict[str, Any]:
             "host": UI_HOST,
             "port": UI_PORT,
             "proxy_port": LOCAL_PROXY_PORT,
+            "proxy_username": "",
+            "proxy_password": "",
+            "dynamic_pool_username": "",
+            "dynamic_pool_password": "",
             "routing_mode": "auto",
             "force_country": "",
             "routing_ip_type": "all",
@@ -380,6 +409,7 @@ def load_ui_config() -> dict[str, Any]:
             "exit_slot_country_map": {},
             "exit_slot_isp_map": {},
             "exit_slot_pin_map": {},
+            "exit_slot_auth_map": {},
         }
         updated = False
         data: dict[str, Any] = {}
@@ -399,6 +429,8 @@ def load_ui_config() -> dict[str, Any]:
                     "discovery_countries", "exit_slot_active", "exit_slot_paused", "exit_slot_count",
                     "exit_slot_country", "exit_slot_isp", "exit_slot_residential_only",
                     "exit_slot_country_map", "exit_slot_isp_map", "exit_slot_pin_map",
+                    "proxy_username", "proxy_password", "dynamic_pool_username", "dynamic_pool_password",
+                    "exit_slot_auth_map",
                 ]:
                     if key not in data:
                         updated = True
@@ -463,6 +495,22 @@ def load_ui_config() -> dict[str, Any]:
             if not isinstance(config.get(map_key), dict):
                 config[map_key] = {}
                 updated = True
+        try:
+            proxy_user, proxy_pass = normalize_proxy_credentials(config.get("proxy_username"), config.get("proxy_password"))
+            pool_user, pool_pass = normalize_proxy_credentials(config.get("dynamic_pool_username"), config.get("dynamic_pool_password"))
+        except ValueError:
+            proxy_user = proxy_pass = pool_user = pool_pass = ""
+            updated = True
+        for key, value in (
+            ("proxy_username", proxy_user), ("proxy_password", proxy_pass),
+            ("dynamic_pool_username", pool_user), ("dynamic_pool_password", pool_pass),
+        ):
+            if config.get(key) != value:
+                config[key] = value
+                updated = True
+        if not isinstance(config.get("exit_slot_auth_map"), dict):
+            config["exit_slot_auth_map"] = {}
+            updated = True
             
         if not auth_file.exists() or updated:
             try:
@@ -494,6 +542,7 @@ try:
         UI_PORT = bounded_int(_init_cfg["port"], UI_PORT, 1, 65535)
     if "host" in _init_cfg:
         UI_HOST = _init_cfg["host"]
+    apply_main_proxy_credentials(_init_cfg.get("proxy_username", ""), _init_cfg.get("proxy_password", ""))
 except Exception:
     pass
 
@@ -613,6 +662,10 @@ def get_state() -> dict[str, Any]:
     state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
     state["password_set"] = bool(ui_cfg.get("password"))
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
+    state["proxy_username"] = ui_cfg.get("proxy_username", "")
+    state["proxy_password"] = ui_cfg.get("proxy_password", "")
+    state["dynamic_pool_username"] = ui_cfg.get("dynamic_pool_username", "")
+    state["dynamic_pool_password"] = ui_cfg.get("dynamic_pool_password", "")
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
@@ -2379,6 +2432,64 @@ def get_slot_pin_map() -> dict[str, str]:
     return {str(key): str(value).strip() for key, value in raw.items() if str(value).strip()}
 
 
+def get_slot_auth_map() -> dict[str, dict[str, str]]:
+    raw = load_ui_config().get("exit_slot_auth_map") or {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            username, password = normalize_proxy_credentials(value.get("username"), value.get("password"))
+        except ValueError:
+            continue
+        if username and password:
+            result[str(key)] = {"username": username, "password": password}
+    return result
+
+
+def get_slot_auth(index: int) -> tuple[str, str] | None:
+    value = get_slot_auth_map().get(str(index))
+    return (value["username"], value["password"]) if value else None
+
+
+def set_slot_auth(index: int, username: Any, password: Any) -> dict[str, dict[str, str]]:
+    if index < 0 or index >= MAX_EXIT_SLOTS:
+        raise ValueError("槽位超出允许范围")
+    user, secret = normalize_proxy_credentials(username, password)
+    with lock:
+        cfg = load_ui_config()
+        auth_map = cfg.setdefault("exit_slot_auth_map", {})
+        if user and secret:
+            auth_map[str(index)] = {"username": user, "password": secret}
+        else:
+            auth_map.pop(str(index), None)
+        write_json(DATA_DIR / "ui_auth.json", cfg)
+    with exit_slots_lock:
+        slot = exit_slots.get(index)
+        if slot is not None:
+            slot["proxy_username"] = user
+            slot["proxy_password"] = secret
+        stop_event = exit_slot_proxy_stops.get(index)
+        registry = exit_slot_proxy_registries.get(index)
+        thread = exit_slot_proxy_threads.get(index)
+    if stop_event is not None:
+        stop_event.set()
+        if registry is not None:
+            registry.close_all()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        with exit_slots_lock:
+            exit_slot_proxy_threads.pop(index, None)
+            exit_slot_proxy_stops.pop(index, None)
+            exit_slot_proxy_registries.pop(index, None)
+        if slot_process_alive(index):
+            ensure_slot_proxy(index)
+    write_slots_state()
+    return get_slot_auth_map()
+
+
 def per_slot_country(index: int) -> str:
     return get_slot_country_map().get(str(index), "") or get_exit_slot_config()["country"]
 
@@ -2617,6 +2728,7 @@ def ensure_slot_proxy(index: int) -> bool:
         thread = threading.Thread(
             target=proxy_server.start_proxy_server,
             args=(SLOT_PROXY_HOST, slot_port(index), slot_device(index), stop_event, registry),
+            kwargs={"credentials": get_slot_auth(index) or ("", "")},
             name=f"aimili-slot-proxy-{index}",
             daemon=True,
         )
@@ -2682,6 +2794,8 @@ def bring_up_slot(index: int, node: dict[str, Any]) -> bool:
                 "message": "",
                 "exit_ip": "",
                 "egress_ok": None,
+                "proxy_username": get_slot_auth(index)[0] if get_slot_auth(index) else "",
+                "proxy_password": get_slot_auth(index)[1] if get_slot_auth(index) else "",
             }
         log_to_json("INFO", "MultiExit", f"槽位 {index} 已就绪: {node.get('ip')}:{slot_port(index)}")
         return True
@@ -2717,6 +2831,8 @@ def mark_slot_pending(index: int, reason: str) -> None:
             "ip_type_confidence": "", "location": "", "owner": "", "latency_ms": 0,
             "process": None, "status": "pending", "since": time.time(), "message": reason,
             "exit_ip": "", "egress_ok": False,
+            "proxy_username": get_slot_auth(index)[0] if get_slot_auth(index) else "",
+            "proxy_password": get_slot_auth(index)[1] if get_slot_auth(index) else "",
         }
 
 
@@ -2773,7 +2889,13 @@ def write_slots_state() -> None:
                 "slot", "device", "table", "port", "node_id", "country", "country_short", "ip",
                 "ip_type", "ip_type_confidence", "location", "owner", "latency_ms", "message",
                 "since", "exit_ip", "egress_ok"
-            )} | {"status": "up" if alive else slot.get("status", "down"), "country_filter": country_map.get(str(index), ""), "isp_filter": isp_map.get(str(index), "")})
+            )} | {
+                "status": "up" if alive else slot.get("status", "down"),
+                "country_filter": country_map.get(str(index), ""),
+                "isp_filter": isp_map.get(str(index), ""),
+                "proxy_username": slot.get("proxy_username", get_slot_auth(index)[0] if get_slot_auth(index) else ""),
+                "proxy_password": slot.get("proxy_password", get_slot_auth(index)[1] if get_slot_auth(index) else ""),
+            })
     cfg = get_exit_slot_config()
     write_json(SLOTS_FILE, {
         "schema_version": 1,
@@ -2782,6 +2904,10 @@ def write_slots_state() -> None:
         "country": cfg["country"],
         "isp": cfg["isp"],
         "residential_only": cfg["residential_only"],
+        "dynamic_pool_auth": {
+            "username": load_ui_config().get("dynamic_pool_username", ""),
+            "password": load_ui_config().get("dynamic_pool_password", ""),
+        },
         "proxy_host": SLOT_PROXY_HOST,
         "slots": snapshot,
     })
@@ -5110,9 +5236,10 @@ INDEX_HTML = r"""<!doctype html>
     /* Option Card Styles for Proxy/Routing Settings */
     .option-group {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 10px;
       margin-top: 6px;
+      min-width: 0;
     }
     
     @media (max-width: 480px) {
@@ -5135,6 +5262,8 @@ INDEX_HTML = r"""<!doctype html>
       transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
       user-select: none;
       position: relative;
+      min-width: 0;
+      overflow-wrap: anywhere;
       text-align: left;
     }
     
@@ -5161,6 +5290,34 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 11px;
       color: var(--text-secondary);
       line-height: 1.3;
+    }
+
+    .auth-settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin: 4px 0 18px;
+    }
+    .auth-settings-card {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      background: rgba(255,255,255,0.02);
+    }
+    .auth-clear-btn {
+      margin-top: 9px;
+      min-height: 30px;
+    }
+    .auth-help {
+      margin-top: 8px;
+      color: var(--text-secondary);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+    @media (max-width: 620px) {
+      .auth-settings-grid { grid-template-columns: minmax(0, 1fr); }
+      .network-modal-content { width: 100%; }
     }
 
     .exit-slots-config {
@@ -5241,6 +5398,14 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 8px;
     }
 
+    .exit-slot-auth-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
+      gap: 6px;
+      align-items: center;
+      margin-top: 8px;
+    }
+
     .exit-slot-actions {
       display: flex;
       gap: 6px;
@@ -5272,6 +5437,10 @@ INDEX_HTML = r"""<!doctype html>
       .exit-slot-filter-row button {
         grid-column: 1 / -1;
       }
+      .exit-slot-auth-row {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      }
+      .exit-slot-auth-row button { width: 100%; }
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -5529,7 +5698,7 @@ INDEX_HTML = r"""<!doctype html>
 
   <!-- Network Modal (代理及网络设置，包括出站路由) -->
   <div id="network_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="network_modal_title" aria-hidden="true">
-    <div class="modal-content" tabindex="-1" style="max-width: 480px;">
+    <div class="modal-content network-modal-content" tabindex="-1" style="max-width: 720px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
         <h3 id="network_modal_title" style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
           <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--primary);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -5549,6 +5718,23 @@ INDEX_HTML = r"""<!doctype html>
           <input type="number" id="net_proxy_port" class="input-field" required min="1024" max="65535" placeholder="7928">
         </div>
 
+        <div class="auth-settings-grid">
+          <div class="auth-settings-card">
+            <label class="form-label" for="net_proxy_username">主代理账号密码（7928）</label>
+            <input type="text" id="net_proxy_username" class="input-field" maxlength="128" autocomplete="off" placeholder="留空表示关闭认证">
+            <input type="text" id="net_proxy_password" class="input-field" maxlength="128" autocomplete="off" placeholder="代理密码（明文显示）" style="margin-top:8px;">
+            <button type="button" class="test-btn auth-clear-btn" onclick="clearProxyCredentials('main')">清除账号密码</button>
+            <div class="auth-help">同时作用于 HTTP、HTTPS CONNECT 和 SOCKS5。</div>
+          </div>
+          <div class="auth-settings-card">
+            <label class="form-label" for="net_pool_username">动态代理池账号密码（17928）</label>
+            <input type="text" id="net_pool_username" class="input-field" maxlength="128" autocomplete="off" placeholder="留空表示关闭认证">
+            <input type="text" id="net_pool_password" class="input-field" maxlength="128" autocomplete="off" placeholder="代理池密码（明文显示）" style="margin-top:8px;">
+            <button type="button" class="test-btn auth-clear-btn" onclick="clearProxyCredentials('pool')">清除账号密码</button>
+            <div class="auth-help">仅用于动态代理池；3x-ui 出站配置需手工同步。</div>
+          </div>
+        </div>
+
         <div style="border-top: 1px dashed rgba(255,255,255,0.08); padding-top: 16px; margin-bottom: 16px;">
           <div class="form-group" style="margin-bottom: 16px;">
             <label class="form-label">IP 出站路由模式</label>
@@ -5565,6 +5751,10 @@ INDEX_HTML = r"""<!doctype html>
               <button type="button" class="option-card" data-value="fixed_region" aria-pressed="false" onclick="setRoutingMode('fixed_region')">
                 <div class="option-card-title">固定地区</div>
                 <div class="option-card-desc">锁定特定国家地区</div>
+              </button>
+              <button type="button" class="option-card" data-value="favorites" aria-pressed="false" onclick="setRoutingMode('favorites')">
+                <div class="option-card-title">收藏节点</div>
+                <div class="option-card-desc">仅使用收藏节点</div>
               </button>
             </div>
           </div>
@@ -6939,7 +7129,7 @@ function renderExitSlots(data) {
           <span class="badge ${statusClass}">${esc(exitSlotStatusText(slot))}</span>
         </div>
         <div class="exit-slot-details">
-          <div class="exit-slot-detail-line">代理：<span class="mono">${esc(data.proxy_host || "127.0.0.1")}:${Number(slot.port || ((data.port_base || 17928) + index))}</span></div>
+          <div class="exit-slot-detail-line">代理：<span class="mono">${esc(data.proxy_host || "127.0.0.1")}:${Number(slot.port || ((data.port_base || 17929) + index))}</span></div>
           <div class="exit-slot-detail-line" title="${esc(nodeTitle)}">节点：${esc(nodeText)}</div>
           <div class="exit-slot-detail-line">出口：${esc(slot.exit_ip || "-")} ${slot.message ? `· ${esc(slot.message)}` : ""}</div>
         </div>
@@ -6951,6 +7141,12 @@ function renderExitSlots(data) {
         <div class="exit-slot-assignment-row">
            <select id="slot_node_${index}" class="input-field" style="height:32px; min-width:0; padding:0 6px;">${exitSlotNodeOptions(slot, usedIds, data.slot_candidates?.[String(index)])}</select>
           <button class="test-btn" type="button" onclick="assignExitSlotNode(${index})">指派</button>
+        </div>
+        <div class="exit-slot-auth-row">
+          <input id="slot_username_${index}" class="input-field" maxlength="128" value="${esc(slot.proxy_username || "")}" placeholder="代理账号（可选）">
+          <input id="slot_password_${index}" class="input-field" maxlength="128" value="${esc(slot.proxy_password || "")}" placeholder="代理密码（明文）">
+          <button class="test-btn" type="button" onclick="saveSlotAuth(${index})">保存认证</button>
+          <button class="test-btn" type="button" onclick="clearSlotAuth(${index})">清除</button>
         </div>
         <div class="exit-slot-actions">
           ${paused ? `<button class="connect-btn" type="button" onclick="slotAction('start_slot', ${index})">启动</button>` : `<button class="test-btn" type="button" onclick="slotAction('stop_slot', ${index})">停止</button>`}
@@ -7005,6 +7201,29 @@ async function saveSlotFilter(index) {
       `slot_isp_${index}`).value.trim()});
     await loadExitSlots(true);
   } catch (error) { alert(error.message || "保存槽位筛选失败"); }
+}
+
+async function saveSlotAuth(index) {
+  const username = $(`slot_username_${index}`).value.trim();
+  const password = $(`slot_password_${index}`).value.trim();
+  if ((username && !password) || (!username && password)) {
+    alert("槽位账号和密码必须同时填写，或同时清空");
+    return;
+  }
+  if (username.length > 128 || password.length > 128 || /[\u0000-\u001f\u007f]/.test(username + password)) {
+    alert("槽位账号密码长度不能超过 128，且不能包含控制字符");
+    return;
+  }
+  try {
+    await exitSlotAction("set_slot_auth", {slot: index, username, password});
+    await loadExitSlots(true);
+  } catch (error) { alert(error.message || "保存槽位认证失败"); }
+}
+
+async function clearSlotAuth(index) {
+  $(`slot_username_${index}`).value = "";
+  $(`slot_password_${index}`).value = "";
+  await saveSlotAuth(index);
 }
 
 async function assignExitSlotNode(index) {
@@ -7287,6 +7506,10 @@ function openNetworkModal() {
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
+    $("net_proxy_username").value = state.proxy_username || "";
+    $("net_proxy_password").value = state.proxy_password || "";
+    $("net_pool_username").value = state.dynamic_pool_username || "";
+    $("net_pool_password").value = state.dynamic_pool_password || "";
     const mode = state.routing_mode || "auto";
     const ipType = state.routing_ip_type || "all";
     $("net_routing_isp").value = state.routing_isp || "";
@@ -7298,6 +7521,12 @@ function openNetworkModal() {
   populateRoutingCountries();
   showModal("network_modal", "#net_proxy_port");
   $("admin_dropdown").style.display = "none";
+}
+
+function clearProxyCredentials(kind) {
+  const prefix = kind === "pool" ? "net_pool" : "net_proxy";
+  $(`${prefix}_username`).value = "";
+  $(`${prefix}_password`).value = "";
 }
 
 function closeNetworkModal() {
@@ -7318,6 +7547,23 @@ async function saveNetwork(e) {
   const forceCountry = $("net_force_country").value;
   const routingIpType = $("net_routing_ip_type").value;
   const routingIsp = $("net_routing_isp").value.trim().slice(0, 256);
+  const proxyUsername = $("net_proxy_username").value.trim();
+  const proxyPassword = $("net_proxy_password").value.trim();
+  const poolUsername = $("net_pool_username").value.trim();
+  const poolPassword = $("net_pool_password").value.trim();
+
+  for (const [label, username, password] of [["主代理", proxyUsername, proxyPassword], ["动态代理池", poolUsername, poolPassword]]) {
+    if ((username && !password) || (!username && password)) {
+      errorDivEl.textContent = `${label}账号和密码必须同时填写，或同时清空`;
+      errorDivEl.style.display = "block";
+      return;
+    }
+    if (username.length > 128 || password.length > 128 || /[\u0000-\u001f\u007f]/.test(username + password)) {
+      errorDivEl.textContent = `${label}账号密码长度不能超过 128，且不能包含控制字符`;
+      errorDivEl.style.display = "block";
+      return;
+    }
+  }
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
     errorDivEl.textContent = "代理出站端口范围必须在 1024 至 65535 之间";
@@ -7354,7 +7600,11 @@ async function saveNetwork(e) {
         routing_mode: routingMode,
         force_country: forceCountry,
          routing_ip_type: routingIpType,
-         routing_isp: routingIsp
+         routing_isp: routingIsp,
+         proxy_username: proxyUsername,
+         proxy_password: proxyPassword,
+         dynamic_pool_username: poolUsername,
+         dynamic_pool_password: poolPassword
       })
     }, 25000);
     const data = await readJsonResponse(res, "保存代理设置失败");
@@ -8314,6 +8564,19 @@ class Handler(BaseHTTPRequestHandler):
                 force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 routing_isp = str(payload.get("routing_isp") or "").strip()[:256]
+                ui_cfg = load_ui_config()
+                try:
+                    proxy_username, proxy_password = normalize_proxy_credentials(
+                        payload.get("proxy_username", ui_cfg.get("proxy_username", "")),
+                        payload.get("proxy_password", ui_cfg.get("proxy_password", "")),
+                    )
+                    dynamic_pool_username, dynamic_pool_password = normalize_proxy_credentials(
+                        payload.get("dynamic_pool_username", ui_cfg.get("dynamic_pool_username", "")),
+                        payload.get("dynamic_pool_password", ui_cfg.get("dynamic_pool_password", "")),
+                    )
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    return
                 
                 try:
                     new_proxy_port_int = int(new_proxy_port)
@@ -8333,7 +8596,6 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": "无效的IP出站类型过滤"}, HTTPStatus.BAD_REQUEST)
                     return
                 
-                ui_cfg = load_ui_config()
                 expected_proxy_port = ui_cfg.get("proxy_port", 7928)
                 fixed_node_id = current_fixed_node_id(ui_cfg) if routing_mode == "fixed_ip" else ""
                 
@@ -8349,6 +8611,10 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["force_country"] = force_country
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg["routing_isp"] = routing_isp
+                ui_cfg["proxy_username"] = proxy_username
+                ui_cfg["proxy_password"] = proxy_password
+                ui_cfg["dynamic_pool_username"] = dynamic_pool_username
+                ui_cfg["dynamic_pool_password"] = dynamic_pool_password
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = False
                 if routing_mode == "fixed_ip":
@@ -8358,6 +8624,9 @@ class Handler(BaseHTTPRequestHandler):
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
+
+                apply_main_proxy_credentials(proxy_username, proxy_password)
+                write_slots_state()
 
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "路由设置已更新")
                 
@@ -8476,7 +8745,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
-        if effective_path in ("/api/set_slot_country", "/api/set_slot_isp", "/api/switch_exit_slot", "/api/assign_slot_node", "/api/add_slot_with_node", "/api/stop_slot", "/api/start_slot", "/api/delete_slot", "/api/add_slot"):
+        if effective_path in ("/api/set_slot_country", "/api/set_slot_isp", "/api/set_slot_auth", "/api/switch_exit_slot", "/api/assign_slot_node", "/api/add_slot_with_node", "/api/stop_slot", "/api/start_slot", "/api/delete_slot", "/api/add_slot"):
             try:
                 payload = self.read_json_body()
                 if effective_path == "/api/add_slot":
@@ -8500,6 +8769,9 @@ class Handler(BaseHTTPRequestHandler):
                         isp_map = set_slot_isp(index, payload.get("isp"))
                         threading.Thread(target=switch_slot_node, args=(index,), daemon=True).start()
                         result = {"ok": True, "isp_map": isp_map, "message": "槽位 ISP 已更新，正在切换节点"}
+                    elif effective_path == "/api/set_slot_auth":
+                        auth_map = set_slot_auth(index, payload.get("username"), payload.get("password"))
+                        result = {"ok": True, "auth_map": auth_map, "message": "槽位代理认证已即时生效"}
                     elif effective_path == "/api/switch_exit_slot":
                         result = switch_slot_node(index)
                     elif effective_path == "/api/assign_slot_node":

@@ -1,8 +1,10 @@
 # AimiliVPN 动态代理池
 
 该服务在回环地址提供一个 SOCKS5 入口，并根据 AimiliVPN 槽位状态选择可用出口。
+入口认证由 AimiliVPN 的 `slots.json` 动态提供：管理后台配置动态池账号密码后，
+入口将在短周期内切换到 USER/PASSWORD 模式；槽位账号密码用于动态池连接对应槽位。
 
-- 默认监听：`127.0.0.1:19380`
+- 默认监听：`127.0.0.1:17928`
 - 不修改现有 `aimili-vpngate -> 127.0.0.1:7928`
 - `config.validation.json` 使用验证容器的 `/data/slots.json`
 - 生产环境应将 `state_command` 切换到独立的 AimiliVPN 多出口实例
@@ -14,7 +16,7 @@
   "tag": "aimili-dynamic-pool",
   "protocol": "socks",
   "settings": {
-    "servers": [{"address": "127.0.0.1", "port": 19380}]
+    "servers": [{"address": "127.0.0.1", "port": 17928, "users": [{"user": "admin", "pass": "admin2012"}]}]
   }
 }
 ```

@@ -26,6 +26,7 @@ from typing import Any, Iterable
 LOG = logging.getLogger("aimili-dynamic-pool")
 SOCKS_VERSION = 5
 NO_AUTH = 0
+USERPASS_AUTH = 2
 SOCKS_REPLY_SUCCEEDED = 0
 
 
@@ -37,6 +38,8 @@ class Slot:
     exit_ip: str = ""
     in_flight: int = 0
     last_error: str = ""
+    username: str = ""
+    password: str = ""
 
 
 def _valid_loopback_host(host: str) -> bool:
@@ -60,6 +63,8 @@ def _slot_from_json(item: Any) -> Slot | None:
         host="127.0.0.1",
         port=port,
         exit_ip=str(item.get("exit_ip") or ""),
+        username=str(item.get("proxy_username") or ""),
+        password=str(item.get("proxy_password") or ""),
     )
 
 
@@ -124,11 +129,29 @@ def _read_address_body(sock: socket.socket, atyp: int) -> tuple[str, int]:
     return host, port
 
 
-def _socks5_connect(sock: socket.socket, host: str, port: int) -> None:
-    sock.sendall(bytes([SOCKS_VERSION, 1, NO_AUTH]))
-    response = _recv_exact(sock, 2)
-    if response != bytes([SOCKS_VERSION, NO_AUTH]):
-        raise ConnectionError("upstream SOCKS5 server rejected no-auth mode")
+def _socks5_connect(
+    sock: socket.socket,
+    host: str,
+    port: int,
+    credentials: tuple[str, str] | None = None,
+) -> None:
+    if credentials and credentials[0] and credentials[1]:
+        sock.sendall(bytes([SOCKS_VERSION, 1, USERPASS_AUTH]))
+        response = _recv_exact(sock, 2)
+        if response != bytes([SOCKS_VERSION, USERPASS_AUTH]):
+            raise ConnectionError("upstream SOCKS5 server rejected username/password mode")
+        username, password = (value.encode("utf-8") for value in credentials)
+        if len(username) > 255 or len(password) > 255:
+            raise ValueError("SOCKS5 credentials are too long")
+        sock.sendall(bytes([1, len(username)]) + username + bytes([len(password)]) + password)
+        auth_response = _recv_exact(sock, 2)
+        if auth_response != b"\x01\x00":
+            raise ConnectionError("upstream SOCKS5 authentication failed")
+    else:
+        sock.sendall(bytes([SOCKS_VERSION, 1, NO_AUTH]))
+        response = _recv_exact(sock, 2)
+        if response != bytes([SOCKS_VERSION, NO_AUTH]):
+            raise ConnectionError("upstream SOCKS5 server rejected no-auth mode")
     sock.sendall(bytes([SOCKS_VERSION, 1, 0]) + _encode_address(host, port))
     response = _recv_exact(sock, 4)
     if response[0] != SOCKS_VERSION or response[1] != SOCKS_REPLY_SUCCEEDED:
@@ -146,10 +169,12 @@ class SlotPool:
         raw_command = config.get("state_command")
         self._state_command = [str(value) for value in raw_command] if isinstance(raw_command, list) else []
         self._poll_interval = max(5.0, float(config.get("poll_interval", 15)))
+        self._auth_refresh_interval = max(1.0, float(config.get("auth_refresh_interval", 2)))
         self._health_timeout = max(1.0, float(config.get("health_timeout", 8)))
         self._probe_host = str(config.get("probe_host", "api.ipify.org"))
         self._probe_port = int(config.get("probe_port", 80))
         self._slots: dict[int, Slot] = {}
+        self._credentials: tuple[str, str] | None = None
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._refresh_now = threading.Event()
@@ -181,14 +206,16 @@ class SlotPool:
         try:
             with socket.create_connection((slot.host, slot.port), timeout=self._health_timeout) as upstream:
                 upstream.settimeout(self._health_timeout)
-                _socks5_connect(upstream, self._probe_host, self._probe_port)
+                _socks5_connect(upstream, self._probe_host, self._probe_port, (slot.username, slot.password))
             return slot, True, ""
         except Exception as exc:  # pragma: no cover - exact socket errors vary by platform
             return slot, False, f"{type(exc).__name__}: {exc}"
 
     def refresh(self) -> None:
         try:
-            candidates = active_slots(self._read_state())
+            state = self._read_state()
+            candidates = active_slots(state)
+            self._set_credentials_from_state(state)
         except Exception as exc:
             LOG.warning("读取 Aimili 槽位失败: %s", exc)
             return
@@ -208,6 +235,20 @@ class SlotPool:
             after = set(self._slots)
         if before != after:
             LOG.info("动态出口池更新: active=%s", sorted(after))
+
+    def _set_credentials_from_state(self, state: Any) -> None:
+        pool_auth = state.get("dynamic_pool_auth") if isinstance(state, dict) else None
+        credentials = None
+        if isinstance(pool_auth, dict) and pool_auth.get("username") and pool_auth.get("password"):
+            credentials = (str(pool_auth["username"]), str(pool_auth["password"]))
+        with self._lock:
+            self._credentials = credentials
+
+    def refresh_credentials(self) -> None:
+        try:
+            self._set_credentials_from_state(self._read_state())
+        except Exception as exc:
+            LOG.warning("读取动态池认证配置失败: %s", exc)
 
     def choose(self) -> Slot | None:
         with self._lock:
@@ -230,14 +271,22 @@ class SlotPool:
         with self._lock:
             return [dataclasses.asdict(slot) for slot in sorted(self._slots.values(), key=lambda x: x.index)]
 
+    def credentials(self) -> tuple[str, str] | None:
+        with self._lock:
+            return self._credentials
+
     def run(self) -> None:
         next_refresh = 0.0
+        next_auth_refresh = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
             if now >= next_refresh:
                 self.refresh()
                 next_refresh = now + self._poll_interval
-            self._refresh_now.wait(timeout=max(0.2, next_refresh - time.monotonic()))
+            if now >= next_auth_refresh:
+                self.refresh_credentials()
+                next_auth_refresh = now + self._auth_refresh_interval
+            self._refresh_now.wait(timeout=max(0.2, min(next_refresh, next_auth_refresh) - time.monotonic()))
             self._refresh_now.clear()
 
 
@@ -284,10 +333,28 @@ class SocksPoolServer:
             if header[0] != SOCKS_VERSION:
                 return
             methods = _recv_exact(client, header[1])
-            if NO_AUTH not in methods:
+            credentials = self.pool.credentials()
+            if credentials is not None:
+                if USERPASS_AUTH not in methods:
+                    client.sendall(bytes([SOCKS_VERSION, 0xFF]))
+                    return
+                client.sendall(bytes([SOCKS_VERSION, USERPASS_AUTH]))
+                auth_header = _recv_exact(client, 2)
+                if auth_header[0] != 1:
+                    client.sendall(b"\x01\x01")
+                    return
+                username = _recv_exact(client, auth_header[1]).decode("utf-8", errors="replace")
+                password_length = _recv_exact(client, 1)[0]
+                password = _recv_exact(client, password_length).decode("utf-8", errors="replace")
+                if (username, password) != credentials:
+                    client.sendall(b"\x01\x01")
+                    return
+                client.sendall(b"\x01\x00")
+            elif NO_AUTH not in methods:
                 client.sendall(bytes([SOCKS_VERSION, 0xFF]))
                 return
-            client.sendall(bytes([SOCKS_VERSION, NO_AUTH]))
+            else:
+                client.sendall(bytes([SOCKS_VERSION, NO_AUTH]))
 
             request = _recv_exact(client, 4)
             if request[0] != SOCKS_VERSION or request[1] != 1:
@@ -302,7 +369,7 @@ class SocksPoolServer:
                 try:
                     upstream = socket.create_connection((slot.host, slot.port), timeout=20)
                     upstream.settimeout(20)
-                    _socks5_connect(upstream, target_host, target_port)
+                    _socks5_connect(upstream, target_host, target_port, (slot.username, slot.password))
                     break
                 except Exception as exc:
                     LOG.warning("槽位 %s 建立连接失败: %s", slot.index, exc)
@@ -356,7 +423,7 @@ def load_config(path: str) -> dict[str, Any]:
     host = str(config.get("listen_host", "127.0.0.1"))
     if not _valid_loopback_host(host):
         raise ValueError("listen_host must remain loopback-only")
-    port = int(config.get("listen_port", 19380))
+    port = int(config.get("listen_port", 17928))
     if not 1024 <= port <= 65535:
         raise ValueError("listen_port must be between 1024 and 65535")
     if not config.get("state_file") and not config.get("state_command"):

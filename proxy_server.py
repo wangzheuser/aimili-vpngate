@@ -88,16 +88,21 @@ def parse_host_port(authority: str, default_port: int) -> tuple[str, int]:
         return host, parse_int(port_text) or default_port
     return authority, default_port
 
-def get_proxy_credentials() -> tuple[str | None, str | None]:
+ProxyCredentials = tuple[str, str]
+
+
+def get_proxy_credentials(credentials: ProxyCredentials | None = None) -> tuple[str | None, str | None]:
+    if credentials is not None:
+        return credentials
     user = os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME")
     password = os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD")
     if user is None and password is None:
         return None, None
     return user or "", password or ""
 
-def proxy_auth_enabled() -> bool:
-    user, password = get_proxy_credentials()
-    return user is not None and password is not None
+def proxy_auth_enabled(credentials: ProxyCredentials | None = None) -> bool:
+    user, password = get_proxy_credentials(credentials)
+    return bool(user and password)
 
 def parse_http_basic_auth(lines: list[str]) -> tuple[str | None, str | None]:
     for line in lines:
@@ -117,9 +122,13 @@ def parse_http_basic_auth(lines: list[str]) -> tuple[str | None, str | None]:
         return username, password
     return None, None
 
-def check_credentials(username: str | None, password: str | None) -> bool:
-    expected_user, expected_pass = get_proxy_credentials()
-    if expected_user is None or expected_pass is None:
+def check_credentials(
+    username: str | None,
+    password: str | None,
+    credentials: ProxyCredentials | None = None,
+) -> bool:
+    expected_user, expected_pass = get_proxy_credentials(credentials)
+    if not expected_user or not expected_pass:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
 
@@ -365,12 +374,17 @@ def relay(left: socket.socket, right: socket.socket) -> None:
         if not read_open[left] and not buffers[right] and not read_open[right] and not buffers[left]:
             return
 
-def socks5_client(client: socket.socket, first_byte: bytes, device: str = "tun0") -> None:
+def socks5_client(
+    client: socket.socket,
+    first_byte: bytes,
+    device: str = "tun0",
+    credentials: ProxyCredentials | None = None,
+) -> None:
     upstream = None
     try:
         methods_count = recv_exact(client, 1)[0]
         methods = recv_exact(client, methods_count)
-        if proxy_auth_enabled():
+        if proxy_auth_enabled(credentials):
             if 2 not in methods:
                 client.sendall(b"\x05\xff")
                 return
@@ -381,7 +395,7 @@ def socks5_client(client: socket.socket, first_byte: bytes, device: str = "tun0"
                 return
             username = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
             password = recv_exact(client, recv_exact(client, 1)[0]).decode("utf-8", errors="replace")
-            if not check_credentials(username, password):
+            if not check_credentials(username, password, credentials):
                 client.sendall(b"\x01\x01")
                 return
             client.sendall(b"\x01\x00")
@@ -429,7 +443,12 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
-def http_client(client: socket.socket, first_byte: bytes, device: str = "tun0") -> None:
+def http_client(
+    client: socket.socket,
+    first_byte: bytes,
+    device: str = "tun0",
+    credentials: ProxyCredentials | None = None,
+) -> None:
     upstream = None
     try:
         header = read_http_header(client, first_byte)
@@ -446,9 +465,9 @@ def http_client(client: socket.socket, first_byte: bytes, device: str = "tun0") 
         if not version.startswith("HTTP/"):
             client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             return
-        if proxy_auth_enabled():
+        if proxy_auth_enabled(credentials):
             username, password = parse_http_basic_auth(lines[1:])
-            if not check_credentials(username, password):
+            if not check_credentials(username, password, credentials):
                 client.sendall(
                     b"HTTP/1.1 407 Proxy Authentication Required\r\n"
                     b"Proxy-Authenticate: Basic realm=\"AimiliVPN Proxy\"\r\n"
@@ -510,14 +529,19 @@ def http_client(client: socket.socket, first_byte: bytes, device: str = "tun0") 
         if upstream:
             upstream.close()
 
-def proxy_client(client: socket.socket, address: tuple[str, int], device: str = "tun0") -> None:
+def proxy_client(
+    client: socket.socket,
+    address: tuple[str, int],
+    device: str = "tun0",
+    credentials: ProxyCredentials | None = None,
+) -> None:
     try:
         client.settimeout(30)
         first = recv_exact(client, 1)
         if first == b"\x05":
-            socks5_client(client, first, device)
+            socks5_client(client, first, device, credentials)
         else:
-            http_client(client, first, device)
+            http_client(client, first, device, credentials)
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
@@ -533,6 +557,7 @@ def start_proxy_server(
     device: str = "tun0",
     stop_event: threading.Event | None = None,
     registry: ConnRegistry | None = None,
+    credentials: ProxyCredentials | None = None,
 ) -> None:
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
@@ -617,10 +642,10 @@ def start_proxy_server(
                     if registry is not None:
                         registry.add(client_socket)
                     # 保持默认 tun0 的旧测试和调用签名兼容；槽位显式传设备。
-                    if device == "tun0" and registry is None:
+                    if device == "tun0" and registry is None and credentials is None:
                         proxy_client(client_socket, client_address)
                     else:
-                        proxy_client(client_socket, client_address, device)
+                        proxy_client(client_socket, client_address, device, credentials)
                 finally:
                     if registry is not None:
                         registry.discard(client_socket)

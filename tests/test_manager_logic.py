@@ -158,6 +158,29 @@ class ManagerLogicTests(unittest.TestCase):
             patcher.stop()
         self.temp_dir.cleanup()
 
+    def test_proxy_credentials_require_pair_and_trim_values(self) -> None:
+        self.assertEqual(("user", "pass"), manager.normalize_proxy_credentials(" user ", " pass "))
+        with self.assertRaises(ValueError):
+            manager.normalize_proxy_credentials("user", "")
+        with self.assertRaises(ValueError):
+            manager.normalize_proxy_credentials("u\n", "pass")
+
+    def test_slot_credentials_are_independent_and_clearable(self) -> None:
+        with mock.patch.object(manager, "write_slots_state"):
+            manager.set_slot_auth(0, "slot0", "secret0")
+            manager.set_slot_auth(1, "slot1", "secret1")
+            self.assertEqual(("slot0", "secret0"), manager.get_slot_auth(0))
+            self.assertEqual(("slot1", "secret1"), manager.get_slot_auth(1))
+            manager.set_slot_auth(0, "", "")
+        self.assertIsNone(manager.get_slot_auth(0))
+        self.assertEqual(("slot1", "secret1"), manager.get_slot_auth(1))
+
+    def test_proxy_settings_html_contains_auth_and_all_routing_modes(self) -> None:
+        self.assertIn('id="net_proxy_username"', manager.INDEX_HTML)
+        self.assertIn('id="net_pool_username"', manager.INDEX_HTML)
+        self.assertIn("data-value=\"favorites\"", manager.INDEX_HTML)
+        self.assertIn("set_slot_auth", manager.INDEX_HTML)
+
     def write_nodes(self, count: int) -> list[dict]:
         nodes = []
         for index in range(count):
@@ -1272,18 +1295,27 @@ class ManagerLogicTests(unittest.TestCase):
         manager.exit_slots.clear()
         manager.exit_slots.update(
             {
-                0: {"slot": 0, "port": 17928, "country_short": "JP", "process": live},
+                0: {"slot": 0, "port": 17929, "country_short": "JP", "process": live},
                 1: {"slot": 1, "port": 17929, "country_short": "US", "process": dead},
             }
         )
 
         exported = manager.build_3xui_outbounds()
 
-        self.assertEqual([17928], [item["settings"]["servers"][0]["port"] for item in exported["outbounds"]])
+        self.assertEqual([17929], [item["settings"]["servers"][0]["port"] for item in exported["outbounds"]])
         manager.exit_slots.clear()
 
 
 class ProxyServerConcurrencyTests(unittest.TestCase):
+    def test_explicit_proxy_credentials_override_environment(self) -> None:
+        with mock.patch.dict(os.environ, {"LOCAL_PROXY_USER": "env", "LOCAL_PROXY_PASS": "env-pass"}, clear=False):
+            self.assertTrue(proxy_server.proxy_auth_enabled(("listener", "secret")))
+            self.assertTrue(proxy_server.check_credentials("listener", "secret", ("listener", "secret")))
+            self.assertFalse(proxy_server.check_credentials("env", "env-pass", ("listener", "secret")))
+
+    def test_empty_explicit_credentials_disable_authentication(self) -> None:
+        self.assertFalse(proxy_server.proxy_auth_enabled(("", "")))
+
     def test_connection_registry_closes_all_registered_sockets(self) -> None:
         left, right = __import__("socket").socketpair()
         registry = proxy_server.ConnRegistry()

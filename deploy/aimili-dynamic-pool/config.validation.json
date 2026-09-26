@@ -1,7 +1,8 @@
 {
   "listen_host": "127.0.0.1",
-  "listen_port": 19380,
+  "listen_port": 17928,
   "poll_interval": 15,
+  "auth_refresh_interval": 2,
   "health_timeout": 8,
   "probe_host": "api.ipify.org",
   "probe_port": 80,
