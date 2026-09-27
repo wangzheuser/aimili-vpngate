@@ -9,7 +9,7 @@
   "state_command": [
     "docker",
     "exec",
-    "aimilivpn-validation",
+    "aimilivpn",
     "cat",
     "/data/slots.json"
   ]
