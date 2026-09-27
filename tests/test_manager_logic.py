@@ -767,6 +767,26 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertTrue(process.running)
         stop_mock.assert_not_called()
 
+    def test_maintenance_releases_state_lock_before_auto_switch(self) -> None:
+        nodes = self.write_nodes(1)
+        nodes[0]["probe_status"] = "available"
+        manager.write_json(manager.NODES_FILE, nodes)
+
+        def assert_state_lock_released(*args, **kwargs) -> None:
+            self.assertFalse(manager.lock._is_owned())
+
+        with (
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "fetch_candidates", return_value=nodes),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "auto_switch_node", side_effect=assert_state_lock_released) as switch_mock,
+            mock.patch.object(manager, "INITIAL_CONNECT_TEST_LIMIT", 0),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            manager.maintain_valid_nodes()
+
+        switch_mock.assert_called_once_with()
+
     def test_fetch_timeout_skips_insecure_https_retry(self) -> None:
         csv_text = valid_snapshot()
 

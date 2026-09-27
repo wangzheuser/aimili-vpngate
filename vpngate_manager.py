@@ -3799,6 +3799,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             )
         is_connecting = False
         
+        auto_switch_needed = False
         with lock:
             merged = read_nodes()
             
@@ -3832,7 +3833,13 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         available_candidates = apply_routing_filters(available_candidates, ui_cfg)
                         
                         if available_candidates:
-                            auto_switch_node()
+                            # Decide while holding the state lock, but perform
+                            # the potentially long OpenVPN/network operation
+                            # after releasing it so UI requests cannot stall.
+                            auto_switch_needed = True
+
+        if auto_switch_needed:
+            auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         total_tested = len(fast_results) + len(tested_results)
