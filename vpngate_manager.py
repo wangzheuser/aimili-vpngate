@@ -8234,6 +8234,15 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def do_GET(self) -> None:
+        # Keep the container health probe independent from the secret UI path
+        # and from VPN/tunnel state.  This endpoint must remain lightweight so
+        # Docker can distinguish an HTTP server that actually responds from a
+        # process that merely owns the listening socket.
+        request_path = urllib.parse.urlsplit(self.path).path
+        if request_path == "/healthz":
+            self.send_json({"status": "ok"})
+            return
+
         effective_path = self.validate_path()
         if effective_path == "": return
         

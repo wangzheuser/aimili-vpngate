@@ -45,6 +45,6 @@ EXPOSE 8787/tcp 7928/tcp
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD python3 -c "import os,socket; s=socket.create_connection(('127.0.0.1',int(os.environ.get('UI_PORT','8787'))),3); s.close()"
+    CMD curl -fsS --max-time 3 "http://127.0.0.1:${UI_PORT:-8787}/healthz" >/dev/null
 
 CMD ["python3", "vpngate_manager.py"]
