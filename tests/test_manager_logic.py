@@ -1220,6 +1220,44 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("bad-node", manager.slot_bad_nodes)
         self.assertEqual("good-node", manager.pick_slot_node(0, set())["id"])
 
+    def test_pinned_slot_node_respects_country_and_isp_filters(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [
+                {"id": "pinned-us", "probe_status": "available", "country_short": "US", "owner": "NTT", "ip_type": "residential", "ip_type_confidence": "high"},
+                {"id": "jp-good", "probe_status": "available", "country_short": "JP", "owner": "KDDI", "ip_type": "residential", "ip_type_confidence": "high", "latency_ms": 10, "score": 100},
+            ],
+        )
+        manager._save_slot_lists(manager.load_ui_config(), active=[0])
+        manager.set_slot_country(0, "JP")
+        manager.set_slot_isp(0, "KDDI")
+        manager.set_slot_pin(0, "pinned-us")
+
+        selected = manager.pick_slot_node(0, set())
+
+        self.assertEqual("jp-good", selected["id"])
+
+    def test_supervisor_starts_at_most_one_slot_per_round(self) -> None:
+        manager.write_json(
+            manager.NODES_FILE,
+            [
+                {"id": "node-0", "probe_status": "available", "country_short": "JP", "ip_type": "residential", "ip_type_confidence": "high"},
+                {"id": "node-1", "probe_status": "available", "country_short": "JP", "ip_type": "residential", "ip_type_confidence": "high"},
+            ],
+        )
+        manager._save_slot_lists(manager.load_ui_config(), active=[0, 1])
+        manager.exit_slots.clear()
+        starts = []
+        with (
+            mock.patch.object(manager, "slot_process_alive", return_value=False),
+            mock.patch.object(manager, "tear_down_slot"),
+            mock.patch.object(manager, "bring_up_slot", side_effect=lambda index, node: starts.append(index) or True),
+            mock.patch.object(manager, "write_slots_state"),
+        ):
+            manager.supervise_exit_slots_once()
+
+        self.assertEqual([0], starts)
+
     def test_assign_waits_for_supplier_lock_with_bounded_timeout(self) -> None:
         manager.write_json(
             manager.NODES_FILE,

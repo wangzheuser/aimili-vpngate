@@ -2592,7 +2592,10 @@ def pick_slot_node(index: int, used_ids: set[str]) -> dict[str, Any] | None:
     pin = get_slot_pin_map().get(str(index))
     if pin and pin not in used_ids:
         pinned = next((node for node in read_nodes() if node.get("id") == pin), None)
-        if pinned and pinned.get("probe_status") == "available" and _slot_ip_type_allowed(pinned, get_exit_slot_config()["residential_only"]):
+        cfg = get_exit_slot_config()
+        if pinned and pinned.get("probe_status") == "available" and _slot_filters_match(
+            pinned, per_slot_country(index), cfg["residential_only"], per_slot_isp(index)
+        ):
             return pinned
     cfg = get_exit_slot_config()
     picks = select_slot_nodes(used_ids, 1, per_slot_country(index), cfg["residential_only"], per_slot_isp(index))
@@ -2927,6 +2930,7 @@ def supervise_exit_slots_once() -> None:
         for index in known:
             if index not in active:
                 tear_down_slot(index, stop_proxy=True)
+        attempted_start = False
         for index in sorted(active):
             if index in paused:
                 if slot_process_alive(index) or index in exit_slot_proxy_stops:
@@ -2937,17 +2941,22 @@ def supervise_exit_slots_once() -> None:
                 continue
             tear_down_slot(index, stop_proxy=False)
             node = pick_slot_node(index, current_slot_node_ids())
-            if node and not bring_up_slot(index, node):
-                node_id = str(node.get("id") or "")
-                if not get_slot_pin_map().get(str(index)) and node_id:
-                    slot_bad_nodes[node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
-                    reason = f"节点 {node_id} 连接失败，已冷却，自动选择其他节点"
-                else:
-                    reason = f"节点 {node_id} 连接失败，等待重试"
-                mark_slot_pending(index, reason)
-            elif not node:
+            if node:
+                attempted_start = True
+                if not bring_up_slot(index, node):
+                    node_id = str(node.get("id") or "")
+                    if not get_slot_pin_map().get(str(index)) and node_id:
+                        slot_bad_nodes[node_id] = time.time() + SLOT_BAD_NODE_COOLDOWN
+                        reason = f"节点 {node_id} 连接失败，已冷却，自动选择其他节点"
+                    else:
+                        reason = f"节点 {node_id} 连接失败，等待重试"
+                    mark_slot_pending(index, reason)
+            else:
                 scope = per_slot_country(index) or "不限地区"
                 mark_slot_pending(index, f"暂无可用住宅节点（{scope}），等待节点池补齐")
+                attempted_start = True
+            if attempted_start:
+                break
         write_slots_state()
     finally:
         exit_slots_supervise_lock.release()
@@ -2999,6 +3008,9 @@ def assign_node_to_slot(index: int, node_id: str) -> dict[str, Any]:
     if not exit_slots_supervise_lock.acquire(timeout=SLOT_OPERATION_LOCK_TIMEOUT_SECONDS):
         return {"ok": False, "error": "供给器持续忙碌，请稍后重试"}
     try:
+        with exit_slots_lock:
+            if any(other != index and slot.get("node_id") == node_id for other, slot in exit_slots.items()):
+                return {"ok": False, "error": "该节点已被其他槽位使用"}
         set_slot_pin(index, node_id)
         tear_down_slot(index, stop_proxy=True)
         if bring_up_slot(index, node):
@@ -3122,10 +3134,21 @@ def slot_egress_checker_loop() -> None:
         try:
             paused = get_paused_slots()
             pin_map = get_slot_pin_map()
-            for index in get_active_slots():
-                if index in paused or not slot_process_alive(index):
-                    continue
-                ok, exit_ip = check_slot_egress(index)
+            indexes = [
+                index for index in get_active_slots()
+                if index not in paused and slot_process_alive(index)
+            ]
+            results: dict[int, tuple[bool, str]] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(indexes)))) as executor:
+                futures = {executor.submit(check_slot_egress, index): index for index in indexes}
+                for future in concurrent.futures.as_completed(futures):
+                    index = futures[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception:
+                        results[index] = (False, "")
+            for index in indexes:
+                ok, exit_ip = results.get(index, (False, ""))
                 with exit_slots_lock:
                     slot = exit_slots.get(index)
                     if slot is None:
