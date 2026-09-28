@@ -3539,8 +3539,8 @@ def connect_node(node_id: str) -> str:
             sorted_nodes = sort_all_nodes(current_nodes)
             consecutive_proxy_failures = 0
             last_proxy_failure_node_id = node_id
-        write_json(NODES_FILE, sorted_nodes)
-        write_json(auth_file, latest_ui_cfg)
+            write_json(auth_file, latest_ui_cfg)
+            write_json(NODES_FILE, sorted_nodes)
         set_state(
             active_openvpn_node_id=node_id,
             is_connecting=False,
@@ -3695,8 +3695,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 config_path.write_text(config_text, encoding="utf-8")
             except OSError:
                 pass
-        write_json(NODES_FILE, merged)
-        ip_enrichment_wakeup.set()
+        with lock:
+            write_json(NODES_FILE, merged)
+            ip_enrichment_wakeup.set()
 
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
