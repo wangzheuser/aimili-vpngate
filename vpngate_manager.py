@@ -196,6 +196,7 @@ WEB_LOG_MAX_ENTRIES = 500
 lock = threading.RLock()
 maintenance_lock = threading.Lock()
 connection_attempt_lock = threading.Lock()
+openvpn_stop_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
@@ -523,6 +524,24 @@ def load_ui_config() -> dict[str, Any]:
                 pass
                 
         return config
+
+
+def management_ready() -> tuple[bool, str]:
+    """Return a bounded readiness result without waiting on the global state lock."""
+    if not lock.acquire(blocking=False):
+        return False, "management_lock_busy"
+    try:
+        auth_file = DATA_DIR / "ui_auth.json"
+        if auth_file.exists():
+            with auth_file.open("r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if not isinstance(loaded, dict):
+                return False, "config_invalid"
+        return True, "ready"
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return False, "config_unreadable"
+    finally:
+        lock.release()
 
 def persist_discovery_countries(value: Any) -> list[str]:
     if not isinstance(value, list):
@@ -1783,27 +1802,36 @@ def cleanup_policy_routing(table: int = 100) -> None:
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
-    with lock:
+    with openvpn_stop_lock:
+        with lock:
+            process = active_openvpn_process
+            node_id = active_openvpn_node_id
+            config_to_delete = None
+            if node_id:
+                nodes = read_nodes()
+                node = next((item for item in nodes if item.get("id") == node_id), None)
+                if node:
+                    config_to_delete = node.get("config_file")
+
+        # Closing sockets, clearing routes, and waiting for OpenVPN can block.
+        # Keep these operations outside the global state lock so the UI remains
+        # responsive while a node is being replaced.
         reset_main_proxy_connections()
         cleanup_policy_routing()
-        config_to_delete = None
-        if active_openvpn_node_id:
-            nodes = read_nodes()
-            node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
-            if node:
-                config_to_delete = node.get("config_file")
-                
-        stop_process(active_openvpn_process)
-        active_openvpn_process = None
-        active_openvpn_node_id = ""
-        
+        stop_process(process)
+
         if config_to_delete:
             try:
                 path = Path(config_to_delete)
                 if path.exists():
                     path.unlink()
-            except Exception:
+            except OSError:
                 pass
+
+        with lock:
+            if active_openvpn_process is process:
+                active_openvpn_process = None
+                active_openvpn_node_id = ""
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -3508,23 +3536,24 @@ def connect_node(node_id: str) -> str:
                     item["probed_at"] = time.time()
                     _ph = f"[{LOCAL_PROXY_HOST}]" if ":" in LOCAL_PROXY_HOST else LOCAL_PROXY_HOST
                     item["probe_message"] = f"Active node. HTTP proxy: http://{_ph}:{LOCAL_PROXY_PORT}"
-            write_json(NODES_FILE, sort_all_nodes(current_nodes))
-            write_json(auth_file, latest_ui_cfg)
+            sorted_nodes = sort_all_nodes(current_nodes)
             consecutive_proxy_failures = 0
             last_proxy_failure_node_id = node_id
-            set_state(
-                active_openvpn_node_id=node_id,
-                is_connecting=False,
-                pending_node_id="",
-                last_check_message=f"Connected {node_id}",
-                active_node_latency=latency_str,
-                proxy_ok=True,
-                tunnel_ready=True,
-                proxy_ready=True,
-                proxy_ip=res["ip"],
-                proxy_latency_ms=res["latency_ms"],
-                proxy_error="",
-            )
+        write_json(NODES_FILE, sorted_nodes)
+        write_json(auth_file, latest_ui_cfg)
+        set_state(
+            active_openvpn_node_id=node_id,
+            is_connecting=False,
+            pending_node_id="",
+            last_check_message=f"Connected {node_id}",
+            active_node_latency=latency_str,
+            proxy_ok=True,
+            tunnel_ready=True,
+            proxy_ready=True,
+            proxy_ip=res["ip"],
+            proxy_latency_ms=res["latency_ms"],
+            proxy_error="",
+        )
         log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
         cancel_background_refill()
         return f"Connected {node_id}"
@@ -3541,7 +3570,11 @@ def connect_node(node_id: str) -> str:
                     failed_node["probe_status"] = "unavailable"
                     failed_node["probe_message"] = str(exc)
                     failed_node["probed_at"] = time.time()
-                    write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                    failed_nodes = sort_all_nodes(current_nodes)
+                else:
+                    failed_nodes = None
+            if failed_nodes is not None:
+                write_json(NODES_FILE, failed_nodes)
             clear_active_connection_state(f"连接失败: {exc}")
         else:
             set_state(is_connecting=False, pending_node_id="", last_check_message=f"连接失败: {exc}")
@@ -3647,16 +3680,23 @@ def maintain_valid_nodes(force: bool = False) -> str:
             if len(merged) > 1000:
                 merged = merged[:1000]
                 
-            for n in merged:
-                config_path = Path(n["config_file"])
-                if not config_path.exists():
-                    try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
-                    except Exception:
-                        pass
-                        
-            write_json(NODES_FILE, merged)
-            ip_enrichment_wakeup.set()
+            config_files_to_write = [
+                (Path(n["config_file"]), n.get("config_text") or "")
+                for n in merged
+                if n.get("config_file")
+            ]
+
+        # Config files can be numerous and slow on a mounted volume.  Write
+        # them after releasing the state lock, then publish the merged index.
+        for config_path, config_text in config_files_to_write:
+            if config_path.exists():
+                continue
+            try:
+                config_path.write_text(config_text, encoding="utf-8")
+            except OSError:
+                pass
+        write_json(NODES_FILE, merged)
+        ip_enrichment_wakeup.set()
 
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
@@ -8271,6 +8311,11 @@ class Handler(BaseHTTPRequestHandler):
         request_path = urllib.parse.urlsplit(self.path).path
         if request_path == "/healthz":
             self.send_json({"status": "ok"})
+            return
+        if request_path == "/readyz":
+            ready, reason = management_ready()
+            status = HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE
+            self.send_json({"status": "ready" if ready else "not_ready", "reason": reason}, status)
             return
 
         effective_path = self.validate_path()

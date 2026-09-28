@@ -24,6 +24,9 @@ RELAY_HIGH_WATER = parse_positive_int(os.environ.get("LOCAL_PROXY_RELAY_BUFFER")
 RELAY_IDLE_TIMEOUT = parse_positive_int(os.environ.get("LOCAL_PROXY_RELAY_TIMEOUT"), 300)
 _dns_cache: dict[str, tuple[str, float]] = {}
 _dns_cache_lock = threading.Lock()
+_route_error_log_lock = threading.Lock()
+_last_route_error_log = 0.0
+ROUTE_ERROR_LOG_INTERVAL = parse_positive_int(os.environ.get("LOCAL_PROXY_ROUTE_LOG_INTERVAL"), 10)
 
 
 class ConnRegistry:
@@ -289,8 +292,35 @@ def purge_dns_cache(device: str | None = None) -> int:
             _dns_cache.pop(key, None)
         return len(keys)
 
+
+def network_device_exists(device: str) -> bool:
+    """Check the interface before DNS/socket setup to fail fast when VPN is down."""
+    if not device or os.name != "posix":
+        return True
+    try:
+        socket.if_nametoindex(device)
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def log_route_error(message: str) -> None:
+    """Limit repeated tun-device failures so a dead VPN cannot flood stdout."""
+    global _last_route_error_log
+    now = time.monotonic()
+    with _route_error_log_lock:
+        if now - _last_route_error_log < ROUTE_ERROR_LOG_INTERVAL:
+            return
+        _last_route_error_log = now
+    print(message, flush=True)
+
 def create_connection(address: tuple[str, int], timeout: float = 20, device: str = "tun0") -> socket.socket:
     host, port = address
+    if not network_device_exists(device):
+        raise OSError(
+            "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 "
+            f"{device} 失败，找不到设备！这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。"
+        )
     resolved_ip = resolve_dns_over_tun0(host, device=device)
     if resolved_ip:
         host = resolved_ip
@@ -545,7 +575,7 @@ def proxy_client(
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
-            print(f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}", flush=True)
+            log_route_error(f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}")
         try:
             client.close()
         except OSError:

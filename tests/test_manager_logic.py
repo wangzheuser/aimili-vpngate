@@ -181,6 +181,25 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("data-value=\"favorites\"", manager.INDEX_HTML)
         self.assertIn("set_slot_auth", manager.INDEX_HTML)
 
+    def test_management_ready_does_not_wait_for_busy_global_lock(self) -> None:
+        busy_lock = mock.Mock()
+        busy_lock.acquire.return_value = False
+        with mock.patch.object(manager, "lock", busy_lock):
+            ready, reason = manager.management_ready()
+
+        self.assertFalse(ready)
+        self.assertEqual("management_lock_busy", reason)
+        busy_lock.acquire.assert_called_once_with(blocking=False)
+
+    def test_management_ready_accepts_readable_config(self) -> None:
+        auth_file = manager.DATA_DIR / "ui_auth.json"
+        auth_file.write_text(json.dumps({"username": "admin"}), encoding="utf-8")
+
+        ready, reason = manager.management_ready()
+
+        self.assertTrue(ready)
+        self.assertEqual("ready", reason)
+
     def test_multiexit_selfcheck_supports_slot_credentials(self) -> None:
         script = (manager.ROOT_DIR / "scripts" / "selfcheck_multiexit.sh").read_text(encoding="utf-8")
         self.assertIn("proxy_username", script)
@@ -1391,6 +1410,27 @@ class ProxyServerConcurrencyTests(unittest.TestCase):
 
     def test_empty_explicit_credentials_disable_authentication(self) -> None:
         self.assertFalse(proxy_server.proxy_auth_enabled(("", "")))
+
+    def test_create_connection_fails_before_dns_when_tun_device_is_missing(self) -> None:
+        with (
+            mock.patch.object(proxy_server, "network_device_exists", return_value=False),
+            mock.patch.object(proxy_server, "resolve_dns_over_tun0") as resolve_dns,
+        ):
+            with self.assertRaisesRegex(OSError, "ERR_ROUTE_DEV_NOT_FOUND"):
+                proxy_server.create_connection(("example.test", 443), device="tun0")
+
+        resolve_dns.assert_not_called()
+
+    def test_route_error_logging_is_rate_limited(self) -> None:
+        proxy_server._last_route_error_log = 0.0
+        with (
+            mock.patch.object(proxy_server.time, "monotonic", side_effect=[100.0, 100.1]),
+            mock.patch.object(proxy_server, "print") as print_mock,
+        ):
+            proxy_server.log_route_error("route failed")
+            proxy_server.log_route_error("route failed again")
+
+        print_mock.assert_called_once_with("route failed", flush=True)
 
     def test_connection_registry_closes_all_registered_sockets(self) -> None:
         left, right = __import__("socket").socketpair()
