@@ -181,15 +181,21 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("data-value=\"favorites\"", manager.INDEX_HTML)
         self.assertIn("set_slot_auth", manager.INDEX_HTML)
 
-    def test_management_ready_does_not_wait_for_busy_global_lock(self) -> None:
+    def test_management_ready_reads_config_while_global_lock_is_busy(self) -> None:
+        auth_file = manager.DATA_DIR / "ui_auth.json"
+        auth_file.write_text(json.dumps({"username": "admin"}), encoding="utf-8")
         busy_lock = mock.Mock()
-        busy_lock.acquire.return_value = False
+        busy_lock.acquire.side_effect = AssertionError("readiness must not acquire app lock")
         with mock.patch.object(manager, "lock", busy_lock):
             ready, reason = manager.management_ready()
+        self.assertTrue(ready)
+        self.assertEqual("ready", reason)
 
-        self.assertFalse(ready)
-        self.assertEqual("management_lock_busy", reason)
-        busy_lock.acquire.assert_called_once_with(blocking=False)
+    def test_set_state_does_not_collect_slot_health_under_global_lock(self) -> None:
+        with mock.patch.object(manager, "get_state", side_effect=AssertionError("set_state must not call get_state")):
+            manager.set_state(last_check_message="updated")
+        state = manager.read_json(manager.STATE_FILE, {})
+        self.assertEqual("updated", state.get("last_check_message"))
 
     def test_management_ready_accepts_readable_config(self) -> None:
         auth_file = manager.DATA_DIR / "ui_auth.json"
@@ -805,6 +811,61 @@ class ManagerLogicTests(unittest.TestCase):
             manager.maintain_valid_nodes()
 
         switch_mock.assert_called_once_with()
+
+    def test_maintenance_releases_state_lock_before_stopping_openvpn(self) -> None:
+        manager.active_openvpn_node_id = "active-node"
+
+        def assert_state_lock_released(*args, **kwargs) -> None:
+            self.assertFalse(manager.lock._is_owned())
+
+        with (
+            mock.patch.object(manager, "active_openvpn_running", return_value=False),
+            mock.patch.object(manager, "stop_active_openvpn", side_effect=assert_state_lock_released) as stop_mock,
+            mock.patch.object(manager, "auto_switch_node"),
+            mock.patch.object(manager, "fetch_candidates", return_value=[]),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            result = manager.maintain_valid_nodes()
+
+        self.assertEqual("没有拉取到新节点", result)
+        stop_mock.assert_called_once_with()
+
+    def test_maintenance_publishes_node_index_after_releasing_state_lock(self) -> None:
+        nodes = self.write_nodes(1)
+        nodes[0]["probe_status"] = "available"
+        observed: list[bool] = []
+
+        def assert_state_lock_released(path, value) -> None:
+            if path == manager.NODES_FILE:
+                observed.append(manager.lock._is_owned())
+
+        with (
+            mock.patch.object(manager, "active_openvpn_running", return_value=True),
+            mock.patch.object(manager, "fetch_candidates", return_value=nodes),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "write_json", side_effect=assert_state_lock_released),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            manager.maintain_valid_nodes()
+
+        self.assertTrue(observed)
+        self.assertEqual([False], observed)
+
+    def test_slot_state_publication_reads_auth_before_slot_lock(self) -> None:
+        manager.exit_slots[0] = {"slot": 0, "process": None, "status": "pending"}
+        observed: list[bool] = []
+
+        def auth_map() -> dict[str, dict[str, str]]:
+            observed.append(manager.exit_slots_lock._is_owned())
+            return {}
+
+        with (
+            mock.patch.object(manager, "get_slot_auth_map", side_effect=auth_map),
+            mock.patch.object(manager, "write_json"),
+        ):
+            manager.write_slots_state()
+
+        self.assertEqual([False], observed)
 
     def test_fetch_timeout_skips_insecure_https_retry(self) -> None:
         csv_text = valid_snapshot()

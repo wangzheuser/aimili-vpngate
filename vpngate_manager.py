@@ -527,9 +527,7 @@ def load_ui_config() -> dict[str, Any]:
 
 
 def management_ready() -> tuple[bool, str]:
-    """Return a bounded readiness result without waiting on the global state lock."""
-    if not lock.acquire(blocking=False):
-        return False, "management_lock_busy"
+    """Check the atomically published management config without app locks."""
     try:
         auth_file = DATA_DIR / "ui_auth.json"
         if auth_file.exists():
@@ -540,8 +538,6 @@ def management_ready() -> tuple[bool, str]:
         return True, "ready"
     except (OSError, json.JSONDecodeError, UnicodeError):
         return False, "config_unreadable"
-    finally:
-        lock.release()
 
 def persist_discovery_countries(value: Any) -> list[str]:
     if not isinstance(value, list):
@@ -639,9 +635,14 @@ def log_to_json(level: str, module: str, message: str) -> None:
         print(f"[Log Error] Failed to write JSON log: {e}", flush=True)
 
 def set_state(**updates: Any) -> None:
-    # Keep the read-modify-write transaction atomic across background threads.
+    # Keep the state-file transaction atomic, but do not call get_state() while
+    # holding the global state lock. get_state() collects slot health and
+    # therefore acquires exit_slots_lock; holding both locks here can deadlock
+    # the slot supervisor and leave every management request blocked.
     with lock:
-        state = get_state()
+        state = read_json(STATE_FILE, {})
+        if not isinstance(state, dict):
+            state = {}
         state.update(updates)
         write_json(STATE_FILE, state)
 
@@ -2750,6 +2751,7 @@ def _wait_for_slot_proxy(index: int, timeout: float = 3.0) -> bool:
 
 
 def ensure_slot_proxy(index: int) -> bool:
+    credentials = get_slot_auth(index) or ("", "")
     with exit_slots_lock:
         if index in exit_slot_proxy_threads and exit_slot_proxy_threads[index].is_alive():
             return _wait_for_slot_proxy(index, 1.0)
@@ -2762,7 +2764,7 @@ def ensure_slot_proxy(index: int) -> bool:
         thread = threading.Thread(
             target=proxy_server.start_proxy_server,
             args=(SLOT_PROXY_HOST, slot_port(index), slot_device(index), stop_event, registry),
-            kwargs={"credentials": get_slot_auth(index) or ("", "")},
+            kwargs={"credentials": credentials},
             name=f"aimili-slot-proxy-{index}",
             daemon=True,
         )
@@ -2789,6 +2791,7 @@ def bring_up_slot(index: int, node: dict[str, Any]) -> bool:
         mark_slot_pending(index, "槽位端口与 Web 或主代理端口冲突")
         return False
     config_path = slot_config_path(index)
+    credentials = get_slot_auth(index)
     try:
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
         config_path.write_text(node.get("config_text") or "", encoding="utf-8")
@@ -2828,8 +2831,8 @@ def bring_up_slot(index: int, node: dict[str, Any]) -> bool:
                 "message": "",
                 "exit_ip": "",
                 "egress_ok": None,
-                "proxy_username": get_slot_auth(index)[0] if get_slot_auth(index) else "",
-                "proxy_password": get_slot_auth(index)[1] if get_slot_auth(index) else "",
+                "proxy_username": credentials[0] if credentials else "",
+                "proxy_password": credentials[1] if credentials else "",
             }
         log_to_json("INFO", "MultiExit", f"槽位 {index} 已就绪: {node.get('ip')}:{slot_port(index)}")
         return True
@@ -2858,6 +2861,7 @@ def bring_up_slot(index: int, node: dict[str, Any]) -> bool:
 
 
 def mark_slot_pending(index: int, reason: str) -> None:
+    credentials = get_slot_auth(index)
     with exit_slots_lock:
         exit_slots[index] = {
             "slot": index, "device": slot_device(index), "table": slot_table(index), "port": slot_port(index),
@@ -2865,8 +2869,8 @@ def mark_slot_pending(index: int, reason: str) -> None:
             "ip_type_confidence": "", "location": "", "owner": "", "latency_ms": 0,
             "process": None, "status": "pending", "since": time.time(), "message": reason,
             "exit_ip": "", "egress_ok": False,
-            "proxy_username": get_slot_auth(index)[0] if get_slot_auth(index) else "",
-            "proxy_password": get_slot_auth(index)[1] if get_slot_auth(index) else "",
+            "proxy_username": credentials[0] if credentials else "",
+            "proxy_password": credentials[1] if credentials else "",
         }
 
 
@@ -2913,6 +2917,7 @@ def slot_process_alive(index: int) -> bool:
 def write_slots_state() -> None:
     country_map = get_slot_country_map()
     isp_map = get_slot_isp_map()
+    auth_map = get_slot_auth_map()
     with exit_slots_lock:
         snapshot: list[dict[str, Any]] = []
         for index in sorted(exit_slots):
@@ -2927,8 +2932,8 @@ def write_slots_state() -> None:
                 "status": "up" if alive else slot.get("status", "down"),
                 "country_filter": country_map.get(str(index), ""),
                 "isp_filter": isp_map.get(str(index), ""),
-                "proxy_username": slot.get("proxy_username", get_slot_auth(index)[0] if get_slot_auth(index) else ""),
-                "proxy_password": slot.get("proxy_password", get_slot_auth(index)[1] if get_slot_auth(index) else ""),
+                "proxy_username": slot.get("proxy_username", auth_map.get(str(index), {}).get("username", "")),
+                "proxy_password": slot.get("proxy_password", auth_map.get(str(index), {}).get("password", "")),
             })
     cfg = get_exit_slot_config()
     write_json(SLOTS_FILE, {
@@ -3039,6 +3044,9 @@ def assign_node_to_slot(index: int, node_id: str) -> dict[str, Any]:
         with exit_slots_lock:
             if any(other != index and slot.get("node_id") == node_id for other, slot in exit_slots.items()):
                 return {"ok": False, "error": "该节点已被其他槽位使用"}
+        # Keep the slot lock out of teardown/startup and state publication.
+        # Those paths read the UI config and write shared state under the
+        # global lock, so holding both locks would reverse the lock order.
         set_slot_pin(index, node_id)
         tear_down_slot(index, stop_proxy=True)
         if bring_up_slot(index, node):
@@ -3608,11 +3616,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if routing_mode == "fixed_ip":
                     reconnect_fixed_node_if_needed(ui_cfg)
                 else:
-                    has_active_id = False
                     with lock:
-                        if active_openvpn_node_id:
-                            has_active_id = True
-                            stop_active_openvpn()
+                        has_active_id = bool(active_openvpn_node_id)
+                    if has_active_id:
+                        # Never wait for the OpenVPN stop lock while holding the
+                        # global state lock.  stop_active_openvpn() acquires the
+                        # locks in the opposite order and can otherwise deadlock
+                        # the maintenance thread with a concurrent connection
+                        # cleanup.
+                        stop_active_openvpn()
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
                         is_connecting = False
@@ -3695,9 +3707,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 config_path.write_text(config_text, encoding="utf-8")
             except OSError:
                 pass
-        with lock:
-            write_json(NODES_FILE, merged)
-            ip_enrichment_wakeup.set()
+        # Publish the potentially large node index after releasing the state
+        # lock.  Slow volume I/O must not starve management requests.
+        write_json(NODES_FILE, merged)
+        ip_enrichment_wakeup.set()
 
         initial_tested_ids: set[str] = set()
         fast_results: list[dict[str, Any]] = []
@@ -3855,8 +3868,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 f"【不可用节点】{len(unavailable_nodes)} 个; "
                 f"当前【正在正常运行的活动连接节点】为: {active_node}。"
             )
-            print(f"[周期检测] {status_report}", flush=True)
-            log_to_json("INFO", "Main", status_report)
             
             if active_node != "无" and not active_openvpn_running():
                 warn_msg = f"[诊断警告] 活动节点 {active_node} 被标记为活动状态，但 OpenVPN 进程实际并未正常运行！"
@@ -3878,6 +3889,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             # the potentially long OpenVPN/network operation
                             # after releasing it so UI requests cannot stall.
                             auto_switch_needed = True
+
+        print(f"[周期检测] {status_report}", flush=True)
+        log_to_json("INFO", "Main", status_report)
 
         if auto_switch_needed:
             auto_switch_node()
